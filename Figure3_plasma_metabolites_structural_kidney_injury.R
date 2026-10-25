@@ -1,10 +1,10 @@
 ################################################################
-# Figure 4: Plasma metabolites & structural kidney injury
+# Figure 3: Plasma metabolites & structural kidney injury
 #
-# 4A: Volcano  - interstitial fibrosis (univariate LM, colored by origin)
-# 4B: Volcano  - tubular atrophy (univariate LM, colored by origin)
-# 4C: Heatmap  - PT pseudobulk gene expression vs top-20 fibrosis RF metabolites
-# 4D: Heatmap  - PT pseudobulk gene expression vs top-20 atrophy RF metabolites
+# 3A: Volcano  - interstitial fibrosis (univariate LM, colored by origin)
+# 3B: Volcano  - tubular atrophy (univariate LM, colored by origin)
+# 3C: Heatmap  - PT pseudobulk gene expression vs top-20 fibrosis RF metabolites
+# 3D: Heatmap  - PT pseudobulk gene expression vs top-20 atrophy RF metabolites
 #
 # Volcano inputs are univariate linear-regression results (beta, FDR).
 # Heatmap inputs are participant-level metabolite-gene beta matrices.
@@ -43,7 +43,7 @@ origin_colors <- c(
 )
 
 # ================================================================
-# FIGURE 4A & 4B: VOLCANO PLOTS (colored by metabolite origin)
+# FIGURE 3A & 3B: VOLCANO PLOTS (colored by metabolite origin)
 # ================================================================
 make_volcano <- function(path, title_text, outfile, n_labels = 10) {
   res <- read_csv(path, show_col_types = FALSE)
@@ -92,14 +92,14 @@ make_volcano <- function(path, title_text, outfile, n_labels = 10) {
 
 make_volcano(fib_lm_file,
              "Plasma metabolites associated with interstitial fibrosis",
-             file.path(out_dir, "Figure4A_volcano_fibrosis.png"))
+             file.path(out_dir, "Figure3A_volcano_fibrosis.png"))
 
 make_volcano(ta_lm_file,
              "Plasma metabolites associated with tubular atrophy",
-             file.path(out_dir, "Figure4B_volcano_atrophy.png"))
+             file.path(out_dir, "Figure3B_volcano_atrophy.png"))
 
 # ================================================================
-# FIGURE 4C & 4D: PROXIMAL TUBULE HEATMAPS
+# FIGURE 3C & 3D: PROXIMAL TUBULE HEATMAPS
 # Row-scaled beta matrices; blue-white-red palette
 # ================================================================
 read_heatmap_matrix <- function(path) {
@@ -132,13 +132,13 @@ save_heatmap <- function(mat, title_text, out_png, out_pdf) {
 
 save_heatmap(read_heatmap_matrix(fib_mat_file),
              "PT \u2014 fibrosis RF metabolites",
-             file.path(out_dir, "Figure4C_PT_fibrosis_heatmap.png"),
-             file.path(out_dir, "Figure4C_PT_fibrosis_heatmap.pdf"))
+             file.path(out_dir, "Figure3C_PT_fibrosis_heatmap.png"),
+             file.path(out_dir, "Figure3C_PT_fibrosis_heatmap.pdf"))
 
 save_heatmap(read_heatmap_matrix(ta_mat_file),
              "PT \u2014 tubular atrophy RF metabolites",
-             file.path(out_dir, "Figure4D_PT_tubular_atrophy_heatmap.png"),
-             file.path(out_dir, "Figure4D_PT_tubular_atrophy_heatmap.pdf"))
+             file.path(out_dir, "Figure3D_PT_tubular_atrophy_heatmap.png"),
+             file.path(out_dir, "Figure3D_PT_tubular_atrophy_heatmap.pdf"))
 
-message("\n========== Figure 4 complete ==========")
+message("\n========== Figure 3 complete ==========")
 message("Outputs in: ", out_dir)
