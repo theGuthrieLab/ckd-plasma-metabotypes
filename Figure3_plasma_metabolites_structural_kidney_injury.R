@@ -24,7 +24,7 @@ suppressPackageStartupMessages({
 # ================================================================
 base_dir <- "."   # e.g. "D:/UC Berkeley/KPMP paper/repo/Figure4"
 
-out_dir <- file.path(base_dir, "Figure4_output")
+out_dir <- file.path(base_dir, "Figure3_output")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
 # ---- Input files (place all in base_dir) ----------------------
