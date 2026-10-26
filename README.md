@@ -1,6 +1,6 @@
 # ckd-plasma-metabotypes
 
-Analysis code for the study *"Host, diet, microbiome, and xenobiotic plasma metabolites associate with distinct kidney cell-type transcriptional programs in Chronic Kidney Disease"* (Nowshad,F., Su, M., and Guthrie, L.).
+Analysis code for the study *"Host, diet, microbiome, and xenobiotic plasma metabolites associate with distinct kidney cell-type transcriptional programs in chronic kidney disease"* (Nowshad,F., Su, M., and Guthrie, L.).
 
 This repository contains R scripts that reproduce the figures from the paper by integrating plasma metabolomics with kidney single-cell transcriptomics in the Kidney Precision Medicine Project (KPMP) cohort and two validation cohorts (MDRD and ALTOLD). Each script (`Main_Figure1.R`–`Main_Figure6.R`) regenerates the corresponding manuscript figure from the input files deposited in Dryad (see Data availability below).
 
