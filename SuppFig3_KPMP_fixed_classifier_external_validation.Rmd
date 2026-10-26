@@ -1,0 +1,1553 @@
+---
+title: "About"
+author: "Lab"
+date: ""
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+  library(readxl)
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(janitor)
+  library(tibble)
+  library(ggplot2)
+  library(patchwork)
+  library(cluster)
+  library(glmnet)
+  library(pROC)
+  library(ggrepel)
+```
+
+## 
+```{r load-all-input-files}
+data_dir   <- file.path("../data/")
+output_dir <- file.path("../output_figure1/")
+figure_dir <- file.path("../figures_figure1/")
+
+# Data import
+kpmp_plasma_path   <- file.path(data_dir, "Plasma_Metabolomics.xlsx")
+kpmp_clinical_path <- file.path(data_dir, "Clinical_CKD_HealthyReference_only.xlsx")
+validation_path    <- file.path(data_dir, "Validation_cleaned.xlsx")
+assignment_path    <- file.path(output_dir, "Table_metabotype_assignments.csv")
+
+
+kpmp_plasma_raw <- readxl::read_excel(kpmp_plasma_path)
+kpmp_clinical_raw <- readxl::read_excel(kpmp_clinical_path)
+validation_combined_raw <- readxl::read_excel(validation_path, sheet = "Combined")
+metabotype_assignments_raw <- readr::read_csv(assignment_path, show_col_types = FALSE)
+```
+
+
+
+# Analysis settings
+# KPMP assignment table contains 2 metabotypes
+```{r settings}
+# The saved KPMP assignment table is expected to contain two metabotypes.
+expected_kpmp_k        <- 2L
+validation_k           <- 2L
+nstart_kmeans          <- 50L
+clustering_seed        <- 123L
+expected_shared_count  <- 634L
+enforce_shared_count   <- FALSE
+
+# Elastic-net settings.
+elastic_net_alpha      <- 0.5
+outer_cv_folds         <- 5L
+inner_cv_folds         <- 10L
+classifier_seed        <- 20261011L
+
+# The binary target is 1 for KPMP Metabotype 1 (the lower-eGFR metabotype).
+# The classification threshold is selected from KPMP out-of-fold predictions
+# by Youden's J and is then held fixed for validation.
+positive_metabotype    <- 1L
+
+metabotype_colors <- c("1" = "#1b9e77", "2" = "#7570b3")
+group_colors <- c(
+  "CKD" = "#fc8d62",
+  "Healthy Reference" = "#66c2a5"
+)
+```
+
+
+
+```{r helper-functions}
+clean_id <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- stringr::str_replace_all(x, "`", "")
+  x <- stringr::str_replace_all(x, "\\s+", "")
+  x <- stringr::str_replace(x, "^g(?=[0-9]{1,3}-[0-9]{4,6}$)", "")
+  x
+}
+
+find_first_col <- function(df, candidates) {
+  hit <- intersect(candidates, names(df))
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+extract_bracket_id <- function(x) {
+  stringr::str_match(as.character(x), "\\[([0-9]+)\\]$")[, 2]
+}
+
+extract_validation_name <- function(x) {
+  stringr::str_trim(
+    stringr::str_remove(as.character(x), "\\s*\\[[0-9]+\\]$")
+  )
+}
+
+save_tiff <- function(plot, filename, width, height) {
+  ggplot2::ggsave(
+    filename = file.path(figure_dir, filename),
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 300,
+    compression = "lzw"
+  )
+}
+
+save_pdf <- function(plot, filename, width, height) {
+  ggplot2::ggsave(
+    filename = file.path(figure_dir, filename),
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    device = grDevices::cairo_pdf
+  )
+}
+
+# This is the original cohort-level preprocessing used before k-means:
+# optional log2(x + 1), means and SDs estimated before imputation, mean
+# imputation, and z-scoring.
+preprocess_clustering_matrix <- function(X_raw) {
+  X_raw <- as.matrix(X_raw)
+  storage.mode(X_raw) <- "numeric"
+
+  use_log2 <- all(X_raw >= 0 | is.na(X_raw))
+  X_work <- if (use_log2) log2(X_raw + 1) else X_raw
+
+  means <- colMeans(X_work, na.rm = TRUE)
+  sds <- apply(X_work, 2, stats::sd, na.rm = TRUE)
+  means[!is.finite(means)] <- 0
+  sds[!is.finite(sds) | sds == 0] <- 1
+
+  for (j in seq_len(ncol(X_work))) {
+    missing_j <- is.na(X_work[, j])
+    if (any(missing_j)) X_work[missing_j, j] <- means[j]
+  }
+
+  list(
+    X = scale(X_work, center = means, scale = sds),
+    means = means,
+    sds = sds,
+    use_log2 = use_log2
+  )
+}
+
+# Fit a preprocessing recipe in discovery data. This recipe is part of the
+# classifier and is saved with the final model.
+fit_discovery_preprocessor <- function(X_raw) {
+  X_raw <- as.matrix(X_raw)
+  storage.mode(X_raw) <- "numeric"
+  X_raw[!is.finite(X_raw)] <- NA_real_
+
+  use_log2 <- all(X_raw >= 0 | is.na(X_raw))
+  X_work <- if (use_log2) log2(X_raw + 1) else X_raw
+
+  means <- colMeans(X_work, na.rm = TRUE)
+  sds <- apply(X_work, 2, stats::sd, na.rm = TRUE)
+  means[!is.finite(means)] <- 0
+  sds[!is.finite(sds) | sds == 0] <- 1
+
+  for (j in seq_len(ncol(X_work))) {
+    missing_j <- is.na(X_work[, j])
+    if (any(missing_j)) X_work[missing_j, j] <- means[j]
+  }
+
+  list(
+    X = scale(X_work, center = means, scale = sds),
+    recipe = list(
+      feature_names = colnames(X_raw),
+      use_log2 = use_log2,
+      means = means,
+      sds = sds
+    )
+  )
+}
+
+# Apply the KPMP-fitted recipe to new participants. No validation mean, SD,
+# imputation value, outcome, or cluster assignment is used here.
+apply_discovery_preprocessor <- function(X_raw, recipe) {
+  X_raw <- as.matrix(X_raw)
+  storage.mode(X_raw) <- "numeric"
+
+  missing_features <- setdiff(recipe$feature_names, colnames(X_raw))
+  if (length(missing_features) > 0) {
+    stop(
+      "New data are missing classifier feature(s): ",
+      paste(missing_features, collapse = ", ")
+    )
+  }
+
+  X_raw <- X_raw[, recipe$feature_names, drop = FALSE]
+  X_raw[!is.finite(X_raw)] <- NA_real_
+
+  if (recipe$use_log2) {
+    if (any(X_raw < -1, na.rm = TRUE)) {
+      stop("Negative validation values below -1 cannot receive log2(x + 1).")
+    }
+    X_raw <- log2(X_raw + 1)
+  }
+
+  for (j in seq_len(ncol(X_raw))) {
+    missing_j <- is.na(X_raw[, j])
+    if (any(missing_j)) X_raw[missing_j, j] <- recipe$means[j]
+  }
+
+  scale(X_raw, center = recipe$means, scale = recipe$sds)
+}
+
+make_stratified_folds <- function(y, k, seed) {
+  y <- as.integer(y)
+  class_counts <- table(y)
+  k <- min(as.integer(k), min(class_counts))
+  if (k < 3L) stop("At least three observations per class are required.")
+
+  fold_id <- integer(length(y))
+  classes <- sort(unique(y))
+
+  for (i in seq_along(classes)) {
+    class_index <- which(y == classes[i])
+    set.seed(seed + i)
+    class_index <- sample(class_index)
+    fold_id[class_index] <- rep(seq_len(k), length.out = length(class_index))
+  }
+
+  fold_id
+}
+
+extract_coefficients <- function(cv_fit, s = "lambda.1se") {
+  coefficient_matrix <- as.matrix(stats::coef(cv_fit, s = s))
+  tibble(
+    metabolite = rownames(coefficient_matrix),
+    coefficient = as.numeric(coefficient_matrix[, 1]),
+    lambda = s
+  ) %>%
+    filter(metabolite != "(Intercept)") %>%
+    arrange(desc(abs(coefficient)))
+}
+
+roc_to_df <- function(roc_object, curve_name) {
+  tibble(
+    false_positive_rate = 1 - roc_object$specificities,
+    true_positive_rate = roc_object$sensitivities,
+    curve = curve_name
+  ) %>%
+    arrange(false_positive_rate, true_positive_rate)
+}
+
+safe_profile_contrast <- function(X, group_one) {
+  group_one <- as.logical(group_one)
+  if (sum(group_one) == 0 || sum(!group_one) == 0) {
+    return(rep(NA_real_, ncol(X)))
+  }
+  colMeans(X[group_one, , drop = FALSE]) -
+    colMeans(X[!group_one, , drop = FALSE])
+}
+
+safe_fisher_test <- function(count_table) {
+  tryCatch(
+    stats::fisher.test(count_table),
+    error = function(e) {
+      list(
+        estimate = NA_real_,
+        conf.int = c(NA_real_, NA_real_),
+        p.value = NA_real_
+      )
+    }
+  )
+}
+
+# Convert the known validation enrollment labels to a binary CKD indicator.
+# Unrecognized labels are retained as NA and omitted only from CKD evaluations.
+make_ckd_indicator <- function(group) {
+  normalized <- stringr::str_to_lower(stringr::str_squish(as.character(group)))
+  dplyr::case_when(
+    normalized %in% c("ckd", "chronic kidney disease") ~ 1L,
+    stringr::str_detect(normalized, "healthy|reference|control") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+}
+```
+
+
+
+# Prepare the KPMP discovery cohort
+
+```{r prepare-kpmp}
+prepare_kpmp <- function(plasma_raw, clinical_raw) {
+  plasma_raw <- plasma_raw %>%
+    janitor::clean_names()
+
+  participant_col <- find_first_col(
+    plasma_raw,
+    c("participant_id", "participant", "participantid")
+  )
+  metabolite_col <- find_first_col(
+    plasma_raw,
+    c("metabolite", "metabolite_id")
+  )
+  abundance_col <- find_first_col(
+    plasma_raw,
+    c("abundance", "value", "intensity", "peak_area")
+  )
+  name_col <- find_first_col(
+    plasma_raw,
+    c("chemical_name", "chemical_name_", "chem_name", "biochemical")
+  )
+
+  if (any(is.na(c(participant_col, metabolite_col, abundance_col)))) {
+    stop("Could not detect the required columns in Plasma_Metabolomics.xlsx.")
+  }
+
+  plasma_long <- plasma_raw %>%
+    transmute(
+      participant_id = clean_id(.data[[participant_col]]),
+      metabolite = as.character(.data[[metabolite_col]]),
+      metabolite_label = if (!is.na(name_col)) {
+        as.character(.data[[name_col]])
+      } else {
+        as.character(.data[[metabolite_col]])
+      },
+      abundance = suppressWarnings(as.numeric(.data[[abundance_col]]))
+    ) %>%
+    filter(!is.na(participant_id), !is.na(metabolite), !is.na(abundance))
+
+  labels <- plasma_long %>%
+    distinct(metabolite, metabolite_label)
+
+  wide <- plasma_long %>%
+    group_by(participant_id, metabolite) %>%
+    summarize(abundance = median(abundance, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = metabolite, values_from = abundance)
+
+  missingness <- wide %>%
+    summarize(across(-participant_id, ~ mean(is.na(.x)))) %>%
+    pivot_longer(
+      everything(),
+      names_to = "metabolite",
+      values_to = "missing_rate"
+    )
+
+  # Metabolite IDs before the missingness filter (used for the shared-count audit).
+  all_metabolites <- setdiff(names(wide), "participant_id")
+
+  retained_metabolites <- missingness %>%
+    filter(missing_rate <= 0.70) %>%
+    pull(metabolite)
+
+  wide <- wide %>%
+    select(participant_id, all_of(retained_metabolites))
+
+  clinical_raw <- clinical_raw %>%
+    janitor::clean_names()
+
+  clinical_participant_col <- find_first_col(
+    clinical_raw,
+    c("participant_id", "participant", "participantid")
+  )
+  sample_col <- find_first_col(
+    clinical_raw,
+    c("sample_id", "sampleid", "specimen_id")
+  )
+  group_col <- find_first_col(
+    clinical_raw,
+    c("group", "enrollment_category", "disease_group")
+  )
+  egfr_col <- find_first_col(
+    clinical_raw,
+    c(
+      "baseline_e_gfr_ml_min_1_73m2", "baseline_egfr_ml_min_1_73m2",
+      "baseline_egfr_ml_min_1_73_m2", "egfrcr_cys", "egfr"
+    )
+  )
+
+  if (any(is.na(c(clinical_participant_col, group_col, egfr_col)))) {
+    stop("Could not detect participant ID, group, or eGFR in the KPMP clinical file.")
+  }
+
+  clinical <- clinical_raw %>%
+    transmute(
+      participant_id = clean_id(.data[[clinical_participant_col]]),
+      sample_id = if (!is.na(sample_col)) {
+        clean_id(.data[[sample_col]])
+      } else {
+        participant_id
+      },
+      group = as.character(.data[[group_col]]),
+      egfr = suppressWarnings(as.numeric(.data[[egfr_col]]))
+    ) %>%
+    distinct(participant_id, .keep_all = TRUE)
+
+  analysis_df <- wide %>%
+    inner_join(clinical, by = "participant_id")
+
+  meta <- analysis_df %>%
+    select(participant_id, sample_id, group, egfr)
+
+  X_raw <- analysis_df %>%
+    select(all_of(retained_metabolites)) %>%
+    as.matrix()
+  rownames(X_raw) <- meta$participant_id
+
+  list(
+    meta = meta,
+    X_raw = X_raw,
+    labels = labels,
+    missingness = missingness,
+    all_metabolites = all_metabolites
+  )
+}
+
+kpmp <- prepare_kpmp(kpmp_plasma_raw, kpmp_clinical_raw)
+
+cat(
+  "KPMP matrix:", nrow(kpmp$X_raw), "participants x",
+  ncol(kpmp$X_raw), "metabolites\n"
+)
+```
+
+
+
+```{r prepare-validation}
+
+prepare_validation <- function(combined_raw) {
+  clean_names <- janitor::make_clean_names(names(combined_raw))
+
+  original_name <- function(clean_name) {
+    hit <- which(clean_names == clean_name)
+    if (length(hit) == 0) return(NA_character_)
+    names(combined_raw)[hit[1]]
+  }
+
+  sample_col <- original_name("sample_id")
+  cohort_col <- original_name("cohort")
+  group_col <- original_name("group")
+
+  if (any(is.na(c(sample_col, cohort_col, group_col)))) {
+    stop(
+      "The Combined sheet of Validation_cleaned.xlsx must contain ",
+      "sample_id, cohort, and group columns."
+    )
+  }
+
+  meta <- combined_raw %>%
+    transmute(
+      sample_id = clean_id(.data[[sample_col]]),
+      cohort = as.character(.data[[cohort_col]]),
+      group = as.character(.data[[group_col]]),
+      ckd_status = make_ckd_indicator(.data[[group_col]])
+    )
+
+  feature_df <- combined_raw %>%
+    select(-all_of(c(sample_col, cohort_col, group_col)))
+
+  feature_names <- names(feature_df)
+  metabolite_ids <- extract_bracket_id(feature_names)
+  metabolite_names <- extract_validation_name(feature_names)
+
+  keep_feature <- !is.na(metabolite_ids)
+  feature_df <- feature_df[, keep_feature, drop = FALSE] %>%
+    mutate(across(everything(), ~ suppressWarnings(as.numeric(.))))
+  metabolite_ids <- metabolite_ids[keep_feature]
+  metabolite_names <- metabolite_names[keep_feature]
+
+  X0 <- as.matrix(feature_df)
+  unique_ids <- unique(metabolite_ids)
+
+  X_list <- lapply(unique_ids, function(id) {
+    index <- which(metabolite_ids == id)
+    values <- X0[, index, drop = FALSE]
+    if (ncol(values) == 1) {
+      as.numeric(values[, 1])
+    } else {
+      apply(values, 1, median, na.rm = TRUE)
+    }
+  })
+
+  X_raw <- do.call(cbind, X_list)
+  if (is.vector(X_raw)) X_raw <- matrix(X_raw, ncol = 1)
+  colnames(X_raw) <- unique_ids
+  rownames(X_raw) <- meta$sample_id
+
+  sd_value <- apply(X_raw, 2, stats::sd, na.rm = TRUE)
+  prevalence <- 100 * colSums(!is.na(X_raw) & X_raw != 0) / nrow(X_raw)
+  retain <- is.finite(sd_value) & sd_value > 0 & prevalence >= 30
+  X_raw <- X_raw[, retain, drop = FALSE]
+
+  # Preserve the original validation preprocessing convention: values that
+  # remain undetected after duplicate consolidation are represented as zero.
+  X_raw[is.na(X_raw)] <- 0
+
+  labels <- tibble(
+    metabolite = unique_ids,
+    validation_label = vapply(
+      unique_ids,
+      function(id) metabolite_names[match(id, metabolite_ids)][1],
+      character(1)
+    )
+  ) %>%
+    filter(metabolite %in% colnames(X_raw)) %>%
+    distinct(metabolite, .keep_all = TRUE)
+
+  list(meta = meta, X_raw = X_raw, labels = labels, all_ids = unique_ids)
+}
+
+validation <- prepare_validation(validation_combined_raw)
+
+shared_metabolites <- intersect(
+  colnames(kpmp$X_raw),
+  colnames(validation$X_raw)
+)
+
+cat(
+  "Validation matrix:", nrow(validation$X_raw), "participants x",
+  ncol(validation$X_raw), "retained metabolites\n",
+  "Shared KPMP-validation metabolites:", length(shared_metabolites), "\n"
+)
+
+if (length(shared_metabolites) != expected_shared_count) {
+  count_message <- paste0(
+    "Expected ", expected_shared_count, " shared metabolites but found ",
+    length(shared_metabolites), ". Check the input versions and filtering."
+  )
+  if (enforce_shared_count) stop(count_message) else warning(count_message)
+}
+
+if (length(shared_metabolites) < 10) {
+  stop("Fewer than 10 shared metabolites were identified.")
+}
+```
+# Audit of the shared-metabolite count
+
+```{r shared-metabolite-audit}
+shared_audit <- tibble(
+  step = c(
+    "Shared before any filtering",
+    "After KPMP missingness filter only",
+    "After validation prevalence/variance filter only",
+    "After both filters (used in analysis)"
+  ),
+  n_metabolites = c(
+    length(intersect(kpmp$all_metabolites, validation$all_ids)),
+    length(intersect(colnames(kpmp$X_raw), validation$all_ids)),
+    length(intersect(kpmp$all_metabolites, colnames(validation$X_raw))),
+    length(shared_metabolites)
+  )
+)
+
+readr::write_csv(
+  shared_audit,
+  file.path(output_dir, "Table_shared_metabolite_count_audit.csv")
+)
+
+shared_audit
+```
+
+# Import the saved KPMP metabotype assignments
+```{r import-kpmp-assignments}
+assignment_required_columns <- c(
+  "participant_id", "source_cohort", "metabotype"
+)
+
+metabotype_assignments_clean <- metabotype_assignments_raw %>%
+  janitor::clean_names()
+
+missing_assignment_columns <- setdiff(
+  assignment_required_columns,
+  names(metabotype_assignments_clean)
+)
+if (length(missing_assignment_columns) > 0) {
+  stop(
+    "Table_metabotype_assignments.csv is missing required column(s): ",
+    paste(missing_assignment_columns, collapse = ", ")
+  )
+}
+
+kpmp_assignment_input <- metabotype_assignments_clean %>%
+  filter(stringr::str_to_upper(source_cohort) == "KPMP") %>%
+  transmute(
+    participant_id = clean_id(participant_id),
+    metabotype = suppressWarnings(as.integer(metabotype))
+  ) %>%
+  filter(!is.na(participant_id), !is.na(metabotype)) %>%
+  distinct()
+
+if (anyDuplicated(kpmp_assignment_input$participant_id)) {
+  duplicated_ids <- kpmp_assignment_input %>%
+    count(participant_id) %>%
+    filter(n > 1) %>%
+    pull(participant_id)
+  stop(
+    "Multiple KPMP metabotype assignments were found for: ",
+    paste(duplicated_ids, collapse = ", ")
+  )
+}
+
+observed_kpmp_labels <- sort(unique(kpmp_assignment_input$metabotype))
+expected_kpmp_labels <- seq_len(expected_kpmp_k)
+if (!identical(observed_kpmp_labels, expected_kpmp_labels)) {
+  stop(
+    "Expected saved KPMP metabotype labels ",
+    paste(expected_kpmp_labels, collapse = ", "),
+    " but found ", paste(observed_kpmp_labels, collapse = ", "), "."
+  )
+}
+
+missing_kpmp_assignments <- setdiff(
+  kpmp$meta$participant_id,
+  kpmp_assignment_input$participant_id
+)
+if (length(missing_kpmp_assignments) > 0) {
+  stop(
+    "The saved assignment table is missing KPMP participant(s): ",
+    paste(missing_kpmp_assignments, collapse = ", ")
+  )
+}
+
+extra_kpmp_assignments <- setdiff(
+  kpmp_assignment_input$participant_id,
+  kpmp$meta$participant_id
+)
+if (length(extra_kpmp_assignments) > 0) {
+  warning(
+    length(extra_kpmp_assignments),
+    " saved KPMP assignment(s) are absent from the current metabolomics ",
+    "analysis set and will not be used."
+  )
+}
+
+kpmp_assignments <- kpmp$meta %>%
+  inner_join(kpmp_assignment_input, by = "participant_id") %>%
+  mutate(
+    classifier_outcome = as.integer(metabotype == positive_metabotype)
+  )
+
+stopifnot(nrow(kpmp_assignments) == nrow(kpmp$meta))
+
+kpmp_assignment_summary <- kpmp_assignments %>%
+  group_by(metabotype) %>%
+  summarize(
+    n = n(),
+    mean_egfr = mean(egfr, na.rm = TRUE),
+    sd_egfr = sd(egfr, na.rm = TRUE),
+    n_ckd = sum(make_ckd_indicator(group) == 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  kpmp_assignments,
+  file.path(output_dir, "Table_KPMP_assignments_used_for_classifier.csv")
+)
+readr::write_csv(
+  kpmp_assignment_summary,
+  file.path(output_dir, "Table_KPMP_metabotype_summary.csv")
+)
+
+kpmp_assignment_summary
+```
+
+# Generate an independent validation k = 2 solution for comparison only
+
+```{r independent-validation-k2}
+validation_shared_raw <- validation$X_raw[, shared_metabolites, drop = FALSE]
+validation_clustering_preprocessing <- preprocess_clustering_matrix(
+  validation_shared_raw
+)
+validation_X_cluster <- validation_clustering_preprocessing$X
+rownames(validation_X_cluster) <- validation$meta$sample_id
+
+set.seed(clustering_seed)
+validation_kmeans_k2 <- stats::kmeans(
+  validation_X_cluster,
+  centers = validation_k,
+  nstart = nstart_kmeans,
+  algorithm = "Hartigan-Wong"
+)
+
+validation_ckd_prevalence <- tapply(
+  validation$meta$ckd_status,
+  validation_kmeans_k2$cluster,
+  mean,
+  na.rm = TRUE
+)
+validation_label_order <- order(
+  validation_ckd_prevalence,
+  decreasing = TRUE,
+  na.last = TRUE
+)
+validation_label_map <- setNames(
+  seq_along(validation_label_order),
+  validation_label_order
+)
+validation_independent_metabotype <- as.integer(
+  validation_label_map[as.character(validation_kmeans_k2$cluster)]
+)
+
+validation_independent_assignments <- validation$meta %>%
+  mutate(independent_validation_metabotype = validation_independent_metabotype)
+
+readr::write_csv(
+  validation_independent_assignments,
+  file.path(output_dir, "Table_validation_independent_k2_assignments.csv")
+)
+```
+
+
+# Internal KPMP cross-validation of the complete classifier pipeline
+
+```{r classifier-functions}
+run_nested_oof_classifier <- function(
+    X_raw,
+    y,
+    alpha = 0.5,
+    outer_folds = 5,
+    inner_folds = 10,
+    seed = 1) {
+
+  outer_fold_id <- make_stratified_folds(y, outer_folds, seed)
+  oof_probability <- rep(NA_real_, length(y))
+  fold_summary <- vector("list", max(outer_fold_id))
+
+  for (fold in seq_len(max(outer_fold_id))) {
+    training_index <- which(outer_fold_id != fold)
+    test_index <- which(outer_fold_id == fold)
+
+    fold_preprocessing <- fit_discovery_preprocessor(
+      X_raw[training_index, , drop = FALSE]
+    )
+    X_training <- fold_preprocessing$X
+    X_test <- apply_discovery_preprocessor(
+      X_raw[test_index, , drop = FALSE],
+      fold_preprocessing$recipe
+    )
+
+    y_training <- y[training_index]
+    inner_fold_id <- make_stratified_folds(
+      y_training,
+      inner_folds,
+      seed + 1000L + fold
+    )
+
+    fold_model <- glmnet::cv.glmnet(
+      x = X_training,
+      y = y_training,
+      family = "binomial",
+      alpha = alpha,
+      foldid = inner_fold_id,
+      type.measure = "auc",
+      standardize = FALSE
+    )
+
+    oof_probability[test_index] <- as.numeric(
+      predict(
+        fold_model,
+        newx = X_test,
+        s = "lambda.1se",
+        type = "response"
+      )
+    )
+
+    fold_roc <- pROC::roc(
+      response = y[test_index],
+      predictor = oof_probability[test_index],
+      levels = c(0, 1),
+      direction = "<",
+      quiet = TRUE
+    )
+
+    fold_summary[[fold]] <- tibble(
+      fold = fold,
+      n_training = length(training_index),
+      n_test = length(test_index),
+      auc = as.numeric(pROC::auc(fold_roc)),
+      lambda_1se = fold_model$lambda.1se
+    )
+  }
+
+  oof_roc <- pROC::roc(
+    response = y,
+    predictor = oof_probability,
+    levels = c(0, 1),
+    direction = "<",
+    quiet = TRUE
+  )
+
+  threshold_result <- pROC::coords(
+    oof_roc,
+    x = "best",
+    best.method = "youden",
+    ret = "threshold",
+    transpose = FALSE
+  )
+  fixed_threshold <- if (is.data.frame(threshold_result) || is.matrix(threshold_result)) {
+    as.numeric(threshold_result[1, "threshold"])
+  } else {
+    as.numeric(threshold_result[1])
+  }
+  if (!is.finite(fixed_threshold) || fixed_threshold <= 0 || fixed_threshold >= 1) {
+    warning("A finite KPMP Youden threshold was not available; using 0.5.")
+    fixed_threshold <- 0.5
+  }
+
+  list(
+    probability = oof_probability,
+    roc = oof_roc,
+    fixed_threshold = fixed_threshold,
+    fold_id = outer_fold_id,
+    fold_summary = bind_rows(fold_summary)
+  )
+}
+```
+
+```{r run-kpmp-oof-classifier}
+kpmp_shared_raw <- kpmp$X_raw[, shared_metabolites, drop = FALSE]
+classifier_y <- kpmp_assignments$classifier_outcome
+
+kpmp_oof <- run_nested_oof_classifier(
+  X_raw = kpmp_shared_raw,
+  y = classifier_y,
+  alpha = elastic_net_alpha,
+  outer_folds = outer_cv_folds,
+  inner_folds = inner_cv_folds,
+  seed = classifier_seed
+)
+
+kpmp_oof_predictions <- kpmp_assignments %>%
+  transmute(
+    participant_id,
+    group,
+    egfr,
+    metabotype,
+    classifier_outcome,
+    outer_fold = kpmp_oof$fold_id,
+    probability_metabotype_1 = kpmp_oof$probability,
+    predicted_metabotype = if_else(
+      probability_metabotype_1 >= kpmp_oof$fixed_threshold,
+      1L,
+      2L
+    )
+  )
+
+kpmp_oof_auc_ci <- as.numeric(pROC::ci.auc(kpmp_oof$roc, method = "delong"))
+
+readr::write_csv(
+  kpmp_oof_predictions,
+  file.path(output_dir, "Table_KPMP_out_of_fold_metabotype_predictions.csv")
+)
+readr::write_csv(
+  kpmp_oof$fold_summary,
+  file.path(output_dir, "Table_KPMP_outer_fold_performance.csv")
+)
+```
+
+# Fit the final KPMP model and freeze the complete pipeline
+
+```{r fit-final-kpmp-model}
+final_preprocessing <- fit_discovery_preprocessor(kpmp_shared_raw)
+kpmp_X_classifier <- final_preprocessing$X
+
+final_inner_fold_id <- make_stratified_folds(
+  classifier_y,
+  inner_cv_folds,
+  classifier_seed + 5000L
+)
+
+set.seed(classifier_seed + 5000L)
+final_kpmp_model <- glmnet::cv.glmnet(
+  x = kpmp_X_classifier,
+  y = classifier_y,
+  family = "binomial",
+  alpha = elastic_net_alpha,
+  foldid = final_inner_fold_id,
+  type.measure = "auc",
+  standardize = FALSE
+)
+
+final_coefficients <- extract_coefficients(
+  final_kpmp_model,
+  s = "lambda.1se"
+) %>%
+  left_join(kpmp$labels, by = "metabolite")
+
+preprocessing_table <- tibble(
+  metabolite = final_preprocessing$recipe$feature_names,
+  kpmp_mean_after_optional_log = as.numeric(final_preprocessing$recipe$means),
+  kpmp_sd_after_optional_log = as.numeric(final_preprocessing$recipe$sds),
+  log2_x_plus_1 = final_preprocessing$recipe$use_log2
+)
+
+fixed_classifier <- list(
+  model = final_kpmp_model,
+  preprocessing = final_preprocessing$recipe,
+  threshold = kpmp_oof$fixed_threshold,
+  positive_metabotype = positive_metabotype,
+  shared_metabolites = shared_metabolites,
+  alpha = elastic_net_alpha,
+  lambda = final_kpmp_model$lambda.1se
+)
+
+saveRDS(
+  fixed_classifier,
+  file.path(output_dir, "KPMP__fixed_metabotype_classifier.rds")
+)
+readr::write_csv(
+  final_coefficients,
+  file.path(output_dir, "Table__KPMP_fixed_classifier_coefficients.csv")
+)
+readr::write_csv(
+  preprocessing_table,
+  file.path(output_dir, "Table__KPMP_fixed_preprocessing_parameters.csv")
+)
+```
+
+# Apply the fixed KPMP classifier to validation without retraining
+
+```{r apply-fixed-classifier}
+validation_X_fixed <- apply_discovery_preprocessor(
+  validation_shared_raw,
+  fixed_classifier$preprocessing
+)
+
+validation_probability <- as.numeric(
+  predict(
+    fixed_classifier$model,
+    newx = validation_X_fixed,
+    s = "lambda.1se",
+    type = "response"
+  )
+)
+
+validation_frozen_prediction <- if_else(
+  validation_probability >= fixed_classifier$threshold,
+  1L,
+  2L
+)
+
+validation_predictions <- validation$meta %>%
+  transmute(
+    sample_id,
+    source_cohort = cohort,
+    enrollment_group = group,
+    ckd_status,
+    probability_KPMP_metabotype_1 = validation_probability,
+    KPMP_assigned_metabotype = validation_frozen_prediction
+  ) %>%
+  left_join(
+    validation_independent_assignments %>%
+      select(sample_id, independent_validation_metabotype),
+    by = "sample_id"
+  )
+
+readr::write_csv(
+  validation_predictions,
+  file.path(output_dir, "Table__validation_fixed_KPMP_metabotype_predictions.csv")
+)
+
+validation_predictions %>%
+  count(KPMP_assigned_metabotype, enrollment_group)
+```
+
+# External evaluation
+
+## Agreement with the independent validation k = 2 solution
+
+```{r validation-cluster-agreement}
+agreement_table <- validation_predictions %>%
+  count(
+    KPMP_assigned_metabotype,
+    independent_validation_metabotype,
+    name = "n"
+  ) %>%
+  tidyr::complete(
+    KPMP_assigned_metabotype = 1:2,
+    independent_validation_metabotype = 1:2,
+    fill = list(n = 0L)
+  )
+
+validation_exact_agreement <- mean(
+  validation_predictions$KPMP_assigned_metabotype ==
+    validation_predictions$independent_validation_metabotype
+)
+
+# Cohen's kappa corrects exact agreement for the agreement expected by chance
+# given the two label distributions (the Fisher p-value is not informative here).
+cohen_kappa <- function(x, y, levels = 1:2) {
+  tab <- table(factor(x, levels = levels), factor(y, levels = levels))
+  n <- sum(tab)
+  observed <- sum(diag(tab)) / n
+  expected <- sum(rowSums(tab) * colSums(tab)) / n^2
+  (observed - expected) / (1 - expected)
+}
+
+n_agree <- sum(
+  validation_predictions$KPMP_assigned_metabotype ==
+    validation_predictions$independent_validation_metabotype
+)
+agreement_binom <- stats::binom.test(n_agree, nrow(validation_predictions))
+validation_kappa <- cohen_kappa(
+  validation_predictions$KPMP_assigned_metabotype,
+  validation_predictions$independent_validation_metabotype
+)
+
+agreement_summary <- tibble(
+  metric = c("Exact label agreement", "Cohen's kappa"),
+  estimate = c(validation_exact_agreement, validation_kappa),
+  confidence_lower = c(agreement_binom$conf.int[1], NA_real_),
+  confidence_upper = c(agreement_binom$conf.int[2], NA_real_)
+)
+
+readr::write_csv(
+  agreement_table,
+  file.path(output_dir, "Table__validation_fixed_vs_independent_k2_counts.csv")
+)
+readr::write_csv(
+  agreement_summary,
+  file.path(output_dir, "Table__validation_cluster_agreement_summary.csv")
+)
+
+agreement_summary
+```
+
+## Association of fixed KPMP assignments with validation CKD status
+```{r validation-ckd-evaluation}
+validation_ckd_eval <- validation_predictions %>%
+  filter(!is.na(ckd_status)) %>%
+  mutate(
+    clipped_probability = pmin(
+      pmax(probability_KPMP_metabotype_1, 1e-8),
+      1 - 1e-8
+    ),
+    metabotype_logit_score = qlogis(clipped_probability),
+    standardized_score = as.numeric(scale(metabotype_logit_score))
+  )
+
+if (length(unique(validation_ckd_eval$ckd_status)) < 2) {
+  stop("Both CKD and reference participants are required for external evaluation.")
+}
+
+validation_ckd_roc <- pROC::roc(
+  response = validation_ckd_eval$ckd_status,
+  predictor = validation_ckd_eval$probability_KPMP_metabotype_1,
+  levels = c(0, 1),
+  direction = "<",
+  quiet = TRUE
+)
+validation_ckd_auc_ci <- as.numeric(
+  pROC::ci.auc(validation_ckd_roc, method = "delong")
+)
+
+ckd_assignment_table <- validation_ckd_eval %>%
+  count(KPMP_assigned_metabotype, ckd_status, name = "n") %>%
+  complete(
+    KPMP_assigned_metabotype = 1:2,
+    ckd_status = 0:1,
+    fill = list(n = 0L)
+  )
+
+ckd_assignment_fisher <- safe_fisher_test(
+  table(
+    factor(
+      as.integer(validation_ckd_eval$KPMP_assigned_metabotype == 1L),
+      levels = 0:1
+    ),
+    factor(validation_ckd_eval$ckd_status, levels = 0:1)
+  )
+)
+
+ckd_score_model <- stats::glm(
+  ckd_status ~ standardized_score,
+  data = validation_ckd_eval,
+  family = stats::binomial()
+)
+ckd_score_coef <- summary(ckd_score_model)$coefficients["standardized_score", ]
+ckd_score_log_ci <- stats::confint.default(ckd_score_model)[
+  "standardized_score",
+  ]
+
+ckd_association_summary <- tibble(
+  analysis = c(
+    "AUC: fixed KPMP metabotype probability versus CKD",
+    "Logistic OR for CKD per 1-SD higher metabotype score",
+    "Fisher OR: assigned Metabotype 1 versus CKD"
+  ),
+  estimate = c(
+    as.numeric(pROC::auc(validation_ckd_roc)),
+    exp(ckd_score_coef["Estimate"]),
+    unname(ckd_assignment_fisher$estimate)
+  ),
+  confidence_lower = c(
+    validation_ckd_auc_ci[1],
+    exp(ckd_score_log_ci[1]),
+    ckd_assignment_fisher$conf.int[1]
+  ),
+  confidence_upper = c(
+    validation_ckd_auc_ci[3],
+    exp(ckd_score_log_ci[2]),
+    ckd_assignment_fisher$conf.int[2]
+  ),
+  p_value = c(
+    NA_real_,
+    ckd_score_coef["Pr(>|z|)"],
+    ckd_assignment_fisher$p.value
+  )
+)
+
+readr::write_csv(
+  ckd_assignment_table,
+  file.path(output_dir, "Table__validation_KPMP_assignment_by_CKD.csv")
+)
+readr::write_csv(
+  ckd_association_summary,
+  file.path(output_dir, "Table__validation_CKD_association_summary.csv")
+)
+
+ckd_association_summary
+```
+
+## Metabolite-profile concordance
+
+
+```{r profile-concordance}
+kpmp_profile_contrast <- safe_profile_contrast(
+  kpmp_X_classifier,
+  kpmp_assignments$metabotype == 1L
+)
+validation_predicted_contrast <- safe_profile_contrast(
+  validation_X_fixed,
+  validation_predictions$KPMP_assigned_metabotype == 1L
+)
+validation_independent_contrast <- safe_profile_contrast(
+  validation_X_fixed,
+  validation_predictions$independent_validation_metabotype == 1L
+)
+
+profile_concordance <- tibble(
+  metabolite = shared_metabolites,
+  KPMP_metabotype_contrast = kpmp_profile_contrast,
+  validation_fixed_assignment_contrast = validation_predicted_contrast,
+  validation_independent_k2_contrast = validation_independent_contrast
+) %>%
+  left_join(kpmp$labels, by = "metabolite") %>%
+  left_join(validation$labels, by = "metabolite") %>%
+  mutate(
+    display_label = coalesce(metabolite_label, validation_label, metabolite)
+  )
+
+profile_cor_fixed <- suppressWarnings(
+  cor(
+    profile_concordance$KPMP_metabotype_contrast,
+    profile_concordance$validation_fixed_assignment_contrast,
+    method = "spearman",
+    use = "complete.obs"
+  )
+)
+profile_cor_independent <- suppressWarnings(
+  cor(
+    profile_concordance$KPMP_metabotype_contrast,
+    profile_concordance$validation_independent_k2_contrast,
+    method = "spearman",
+    use = "complete.obs"
+  )
+)
+
+profile_summary <- tibble(
+  comparison = c(
+    "KPMP versus validation fixed-classifier assignments",
+    "KPMP versus validation independent k = 2 assignments"
+  ),
+  spearman_rho = c(profile_cor_fixed, profile_cor_independent),
+  n_metabolites = c(
+    sum(complete.cases(
+      profile_concordance$KPMP_metabotype_contrast,
+      profile_concordance$validation_fixed_assignment_contrast
+    )),
+    sum(complete.cases(
+      profile_concordance$KPMP_metabotype_contrast,
+      profile_concordance$validation_independent_k2_contrast
+    ))
+  )
+)
+
+readr::write_csv(
+  profile_concordance,
+  file.path(output_dir, "Table__shared_metabolite_profile_concordance.csv")
+)
+readr::write_csv(
+  profile_summary,
+  file.path(output_dir, "Table__metabolite_profile_concordance_summary.csv")
+)
+
+profile_summary
+```
+# Figures
+
+## Summary statistics used in the figure
+
+```{r figure-statistics}
+# Proportion of validation participants with CKD in each fixed-classifier
+# metabotype, with exact (Clopper-Pearson) 95% CIs.
+ckd_by_metabotype <- validation_ckd_eval %>%
+  group_by(KPMP_assigned_metabotype) %>%
+  summarize(
+    n = n(),
+    n_ckd = sum(ckd_status == 1L),
+    n_reference = sum(ckd_status == 0L),
+    percent_ckd = 100 * n_ckd / n,
+    ci_low = 100 * stats::binom.test(n_ckd, n)$conf.int[1],
+    ci_high = 100 * stats::binom.test(n_ckd, n)$conf.int[2],
+    .groups = "drop"
+  )
+
+# Share of each validation group assigned to Metabotype 1 (annotated on panel C).
+percent_assigned_m1 <- validation_ckd_eval %>%
+  group_by(ckd_status) %>%
+  summarize(
+    n = n(),
+    percent_metabotype_1 = 100 * mean(KPMP_assigned_metabotype == 1L),
+    .groups = "drop"
+  )
+
+# Proportion of shared metabolites whose Metabotype 1 - 2 contrast has the same
+# sign in KPMP and validation, overall and for metabolites with a clear KPMP effect.
+sign_agree <- function(a, b, min_abs = 0) {
+  keep <- is.finite(a) & is.finite(b) & abs(a) > min_abs
+  mean(sign(a[keep]) == sign(b[keep]))
+}
+large_contrast_cutoff <- 0.5
+
+sign_agreement_summary <- tibble(
+  comparison = rep(
+    c("Fixed-classifier assignments", "Independent k = 2 assignments"),
+    each = 2
+  ),
+  subset = rep(
+    c("All shared metabolites",
+      paste0("|KPMP contrast| > ", large_contrast_cutoff)),
+    times = 2
+  ),
+  n_metabolites = c(
+    sum(is.finite(profile_concordance$KPMP_metabotype_contrast) &
+          is.finite(profile_concordance$validation_fixed_assignment_contrast)),
+    sum(abs(profile_concordance$KPMP_metabotype_contrast) > large_contrast_cutoff &
+          is.finite(profile_concordance$validation_fixed_assignment_contrast),
+        na.rm = TRUE),
+    sum(is.finite(profile_concordance$KPMP_metabotype_contrast) &
+          is.finite(profile_concordance$validation_independent_k2_contrast)),
+    sum(abs(profile_concordance$KPMP_metabotype_contrast) > large_contrast_cutoff &
+          is.finite(profile_concordance$validation_independent_k2_contrast),
+        na.rm = TRUE)
+  ),
+  proportion_same_direction = c(
+    sign_agree(profile_concordance$KPMP_metabotype_contrast,
+               profile_concordance$validation_fixed_assignment_contrast),
+    sign_agree(profile_concordance$KPMP_metabotype_contrast,
+               profile_concordance$validation_fixed_assignment_contrast,
+               large_contrast_cutoff),
+    sign_agree(profile_concordance$KPMP_metabotype_contrast,
+               profile_concordance$validation_independent_k2_contrast),
+    sign_agree(profile_concordance$KPMP_metabotype_contrast,
+               profile_concordance$validation_independent_k2_contrast,
+               large_contrast_cutoff)
+  )
+)
+
+readr::write_csv(
+  ckd_by_metabotype,
+  file.path(output_dir, "Table__validation_CKD_percent_by_assigned_metabotype.csv")
+)
+readr::write_csv(
+  sign_agreement_summary,
+  file.path(output_dir, "Table__metabolite_contrast_sign_agreement.csv")
+)
+
+ckd_by_metabotype
+sign_agreement_summary
+```
+
+## Metabolite-profile concordance panels
+
+```{r profile-concordance-figure, fig.width=12, fig.height=5.5}
+label_metabolites <- profile_concordance %>%
+  slice_max(order_by = abs(KPMP_metabotype_contrast), n = 8) %>%
+  pull(metabolite)
+
+profile_subtitle <- function(rho, comparison_name) {
+  rows <- sign_agreement_summary %>% filter(comparison == comparison_name)
+  sprintf(
+    "Spearman rho = %.2f; same direction for %.0f%% of metabolites\n(%.0f%% when |KPMP contrast| > %.1f)",
+    rho,
+    100 * rows$proportion_same_direction[1],
+    100 * rows$proportion_same_direction[2],
+    large_contrast_cutoff
+  )
+}
+
+p_profile_fixed <- ggplot(
+  profile_concordance,
+  aes(KPMP_metabotype_contrast, validation_fixed_assignment_contrast)
+) +
+  geom_hline(yintercept = 0, color = "grey80") +
+  geom_vline(xintercept = 0, color = "grey80") +
+  geom_point(alpha = 0.55, color = "#2C6E7F") +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.7) +
+  ggrepel::geom_text_repel(
+    data = filter(profile_concordance, metabolite %in% label_metabolites),
+    aes(label = display_label),
+    size = 3,
+    max.overlaps = Inf,
+    min.segment.length = 0
+  ) + theme_cowplot() + panel_border(color="black") +
+  labs(
+    title = "Metabolite profiles: fixed KPMP assignments",
+    subtitle = profile_subtitle(
+      profile_cor_fixed, "Fixed-classifier assignments"
+    ),
+    x = "KPMP contrast (Metabotype 1 - 2)",
+    y = "Validation contrast (fixed assignments)"
+  )
+
+p_profile_independent <- ggplot(
+  profile_concordance,
+  aes(KPMP_metabotype_contrast, validation_independent_k2_contrast)
+) +
+  geom_hline(yintercept = 0, color = "grey80") +
+  geom_vline(xintercept = 0, color = "grey80") +
+  geom_point(alpha = 0.55, color = "#8C6D5C") +
+  geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.7) +
+  ggrepel::geom_text_repel(
+    data = filter(profile_concordance, metabolite %in% label_metabolites),
+    aes(label = display_label),
+    size = 3,
+    max.overlaps = Inf,
+    min.segment.length = 0
+  ) + theme_cowplot() + panel_border(color="black") +
+  labs(
+    title = "Metabolite profiles: independent validation k = 2",
+    subtitle = profile_subtitle(
+      profile_cor_independent, "Independent k = 2 assignments"
+    ),
+    x = "KPMP contrast (Metabotype 1 - 2)",
+    y = "Validation contrast (independent clusters)"
+  )
+
+p_profile_concordance <- (
+  p_profile_fixed | p_profile_independent
+) +
+  plot_annotation(tag_levels = "A")
+
+save_tiff(
+  p_profile_concordance,
+  "Figure_shared_metabolite_profile_concordance.tiff",
+  width = 12,
+  height = 5.5
+)
+save_pdf(
+  p_profile_concordance,
+  "Figure_shared_metabolite_profile_concordance.pdf",
+  width = 12,
+  height = 5.5
+)
+```
+
+## Combined external-validation figure
+
+```{r external-validation-figure, fig.width=16, fig.height=9.5}
+# A. Internal (out-of-fold)  KPMP classification
+kpmp_roc_df <- roc_to_df(kpmp_oof$roc, "KPMP out-of-fold")
+
+p_internal_roc <- ggplot(
+  kpmp_roc_df,
+  aes(false_positive_rate, true_positive_rate)
+) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+  geom_path(linewidth = 1.1, color = "#2C6E7F") +
+  coord_equal() + theme_cowplot() + panel_border(color="black") +
+  labs(
+    title = "KPMP internal \n classification (out-of-fold)",
+    subtitle = sprintf(
+      "AUC %.2f (95%% CI %.2f-%.2f)",
+      as.numeric(pROC::auc(kpmp_oof$roc)),
+      kpmp_oof_auc_ci[1],
+      kpmp_oof_auc_ci[3]
+    ),
+    x = "False-positive rate",
+    y = "True-positive rate"
+  )
+
+# B. CKD composition of each fixed-classifier metabotype in validation
+ckd_bar_data <- validation_ckd_eval %>%
+  count(KPMP_assigned_metabotype, ckd_status, name = "n") %>%
+  group_by(KPMP_assigned_metabotype) %>%
+  mutate(total = sum(n), percent = 100 * n / total) %>%
+  ungroup() %>%
+  mutate(
+    CKD_status = factor(
+      ckd_status,
+      levels = c(0, 1),
+      labels = c("Healthy Reference", "CKD")
+    ),
+    metabotype_label = sprintf(
+      "Metabotype %d\n(n = %d)", KPMP_assigned_metabotype, total
+    )
+  )
+
+ckd_or_row <- ckd_association_summary %>%
+  filter(stringr::str_detect(analysis, "^Fisher OR"))
+
+p_ckd_by_metabotype <- ggplot(
+  ckd_bar_data,
+  aes(metabotype_label, percent, fill = CKD_status)
+) +
+  geom_col(width = 0.65, color = "white") +
+  geom_text(
+    aes(label = sprintf("%.0f%%", percent)),
+    position = position_stack(vjust = 0.5),
+    size = 4
+  ) +
+  scale_fill_manual(values = group_colors, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+  labs(
+    title = "CKD by fixed-classifier assignment",
+    subtitle = sprintf(
+      "OR for CKD, Metabotype 1 vs 2: %.2f (95%% CI %.2f-%.2f)",
+      ckd_or_row$estimate,
+      ckd_or_row$confidence_lower,
+      ckd_or_row$confidence_upper
+    ),
+    x = "Assigned KPMP metabotype (validation cohort)",
+    y = "Participants (%)"
+  ) + theme_cowplot() + panel_border(color="black") +
+  theme(legend.position = "bottom")
+
+# C. Fixed KPMP score in validation
+group_levels <- c(
+  sprintf("Healthy Reference\n(n = %d)", sum(validation_ckd_eval$ckd_status == 0L)),
+  sprintf("CKD\n(n = %d)", sum(validation_ckd_eval$ckd_status == 1L))
+)
+
+validation_plot_data <- validation_ckd_eval %>%
+  mutate(
+    CKD_status = factor(
+      ckd_status,
+      levels = c(0, 1),
+      labels = c("Healthy Reference", "CKD")
+    ),
+    group_label = factor(
+      if_else(ckd_status == 1L, group_levels[2], group_levels[1]),
+      levels = group_levels
+    )
+  )
+
+percent_m1_labels <- validation_plot_data %>%
+  group_by(group_label) %>%
+  summarize(
+    percent_m1 = 100 * mean(KPMP_assigned_metabotype == 1L),
+    .groups = "drop"
+  )
+
+p_validation_scores <- ggplot(
+  validation_plot_data,
+  aes(group_label, probability_KPMP_metabotype_1, fill = CKD_status)
+) +
+  geom_violin(trim = TRUE, alpha = 0.55, color = NA) +
+  geom_boxplot(width = 0.18, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.08, height = 0, size = 0.8, alpha = 0.25) +
+  geom_hline(
+    yintercept = fixed_classifier$threshold,
+    linetype = 2,
+    color = "grey30"
+  ) +
+  geom_text(
+    data = percent_m1_labels,
+    aes(
+      group_label, 1.06,
+      label = sprintf("%.0f%% assigned to\nMetabotype 1", percent_m1)
+    ),
+    inherit.aes = FALSE,
+    size = 3.2,
+    lineheight = 0.9
+  ) +
+  scale_fill_manual(values = group_colors, guide = "none") +
+  scale_y_continuous(breaks = seq(0, 1, 0.25)) +
+  coord_cartesian(ylim = c(0, 1.15)) + theme_cowplot() + panel_border(color="black") +
+  labs(
+    title = "Fixed KPMP score in validation",
+    subtitle = sprintf(
+      "AUC for CKD %.2f (95%% CI %.2f-%.2f)\nDashed line: KPMP-derived threshold = %.3f",
+      as.numeric(pROC::auc(validation_ckd_roc)),
+      validation_ckd_auc_ci[1],
+      validation_ckd_auc_ci[3],
+      fixed_classifier$threshold
+    ),
+    x = NULL,
+    y = "Probability of KPMP Metabotype 1"
+  )
+
+# D. Agreement between fixed assignments and independent validation clustering
+p_cluster_agreement <- ggplot(
+  agreement_table,
+  aes(
+    factor(independent_validation_metabotype),
+    factor(KPMP_assigned_metabotype),
+    fill = n
+  )
+) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = n), size = 5) +
+  scale_fill_gradient(low = "#F7FBFF", high = "#2166AC") +
+  coord_equal() +
+  labs(
+    title = "Agreement with independent validation k = 2",
+    subtitle = sprintf(
+      "Exact agreement = %.1f%%; Cohen's kappa = %.2f",
+      100 * validation_exact_agreement,
+      validation_kappa
+    ),
+    x = "Independent validation clustering",
+    y = "Fixed KPMP classifier",
+    fill = "n"
+  )
+
+# E and F (metabolite profiles) are built in the previous chunk.
+p_external_validation <- (
+  p_internal_roc | p_ckd_by_metabotype | p_validation_scores
+) / (
+  p_cluster_agreement | p_profile_fixed | p_profile_independent
+) +
+  plot_annotation(tag_levels = "A")
+
+save_tiff(
+  p_external_validation,
+  "Figure_fixed_KPMP_classifier_external_validation.tiff",
+  width = 16,
+  height = 9.5
+)
+save_pdf(
+  p_external_validation,
+  "Figure__fixed_KPMP_classifier_external_validation.pdf",
+  width = 16,
+  height = 9.5
+)
+
+#p_external_validation
+```
+
+

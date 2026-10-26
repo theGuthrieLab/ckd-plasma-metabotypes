@@ -1,0 +1,1740 @@
+---
+title: "Metabotype"
+author: "Lab"
+date: ""
+output: html_document
+---
+# Libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(readxl)
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(janitor)
+  library(tibble)
+  library(ggplot2)
+  library(patchwork)
+  library(cluster)
+  library(vegan)
+  library(clue)
+})
+```
+
+# Data Files and Locations
+```{r}
+# Locations
+data_dir   <- file.path("../data/")
+output_dir <- file.path("../output_figure1/")
+figure_dir <- file.path("../figures_figure1/")
+# Data import
+kpmp_plasma_path   <- file.path(data_dir, "Plasma_Metabolomics.xlsx")
+kpmp_clinical_path <- file.path(data_dir, "Clinical_CKD_HealthyReference_only.xlsx")
+validation_path    <- file.path(data_dir, "Validation_cleaned.xlsx")
+```
+
+# Clustering parameters
+```{r}
+k_grid        <- 2:10
+nstart_kmeans <- 50
+n_perm        <- 999
+random_seed   <- 123
+
+# Repeated-subsampling parameters
+n_subsamples      <- 1000
+subsample_fraction <- 0.80
+subsample_seed     <- 20261007
+
+# Validation feature-count check
+expected_shared_metabolites <- 634
+enforce_expected_shared_count <- FALSE
+
+metabotype_colors <- c(
+  "1" = "#1b9e77", "2" = "#7570b3", "3" = "#8C6D5C",
+  "4" = "#e7298a", "5" = "#66a61e", "6" = "#e6ab02",
+  "7" = "#a6761d", "8" = "#666666", "9" = "#1f78b4",
+  "10" = "#b2df8a"
+)
+
+cohort_colors <- c("KPMP" = "#ef8a62", "Validation" = "#67a9cf")
+```
+
+
+# Helper functions
+
+```{r helper-functions}
+clean_id <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- stringr::str_replace_all(x, "`", "")
+  x <- stringr::str_replace_all(x, "\\s+", "")
+  x <- stringr::str_replace(x, "^g(?=[0-9]{1,3}-[0-9]{4,6}$)", "")
+  x
+}
+
+find_first_col <- function(df, candidates) {
+  hit <- intersect(candidates, names(df))
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+extract_bracket_id <- function(x) {
+  stringr::str_match(as.character(x), "\\[([0-9]+)\\]$")[, 2]
+}
+
+extract_validation_name <- function(x) {
+  stringr::str_trim(stringr::str_remove(as.character(x), "\\s*\\[[0-9]+\\]$"))
+}
+
+save_tiff <- function(plot, filename, width, height) {
+  ggplot2::ggsave(
+    filename = file.path(figure_dir, filename),
+    plot = plot,
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 300,
+    compression = "lzw"
+  )
+}
+
+# Reproduce the original preprocessing order exactly:
+# 1) log2(x + 1) transform when all observed values are non-negative;
+# 2) calculate means and SDs from the observed (non-missing) values;
+# 3) replace missing values with the corresponding metabolite mean; and
+# 4) z-score using the means and SDs calculated before imputation.
+preprocess_full_matrix <- function(X_raw) {
+  X_raw <- as.matrix(X_raw)
+  storage.mode(X_raw) <- "numeric"
+
+  use_log2 <- all(X_raw >= 0 | is.na(X_raw))
+  X_work <- if (use_log2) log2(X_raw + 1) else X_raw
+
+  # Match the original code: estimate both parameters before imputation.
+  means <- colMeans(X_work, na.rm = TRUE)
+  sds <- apply(X_work, 2, stats::sd, na.rm = TRUE)
+
+  means[!is.finite(means)] <- 0
+  sds[!is.finite(sds) | sds == 0] <- 1
+
+  for (j in seq_len(ncol(X_work))) {
+    miss <- is.na(X_work[, j])
+    if (any(miss)) X_work[miss, j] <- means[j]
+  }
+
+  X_scaled <- scale(X_work, center = means, scale = sds)
+
+  list(
+    X = X_scaled,
+    means = means,
+    sds = sds,
+    use_log2 = use_log2
+  )
+}
+
+# Apply the same original preprocessing order within each participant subset.
+# The feature set is held fixed, but subset-specific means and SDs are estimated
+# from observed values before missing values are mean-imputed.
+preprocess_subsample_matrix <- function(X_raw_subset, use_log2) {
+  X_work <- as.matrix(X_raw_subset)
+  storage.mode(X_work) <- "numeric"
+
+  if (use_log2) X_work <- log2(X_work + 1)
+
+  # Match the full-data preprocessing: calculate SDs before imputation.
+  means <- colMeans(X_work, na.rm = TRUE)
+  sds <- apply(X_work, 2, stats::sd, na.rm = TRUE)
+
+  means[!is.finite(means)] <- 0
+  sds[!is.finite(sds) | sds == 0] <- 1
+
+  for (j in seq_len(ncol(X_work))) {
+    miss <- is.na(X_work[, j])
+    if (any(miss)) X_work[miss, j] <- means[j]
+  }
+
+  scale(X_work, center = means, scale = sds)
+}
+
+adjusted_rand_index <- function(reference, candidate) {
+  tab <- table(reference, candidate)
+  choose2 <- function(x) x * (x - 1) / 2
+
+  n <- sum(tab)
+  if (n < 2) return(NA_real_)
+
+  observed <- sum(choose2(tab))
+  row_pairs <- sum(choose2(rowSums(tab)))
+  col_pairs <- sum(choose2(colSums(tab)))
+  total_pairs <- choose2(n)
+  expected <- row_pairs * col_pairs / total_pairs
+  maximum <- 0.5 * (row_pairs + col_pairs)
+  denominator <- maximum - expected
+
+  if (denominator == 0) return(1)
+  (observed - expected) / denominator
+}
+
+# Resolve arbitrary k-means label switching by maximizing agreement with the
+# full-data reference assignments among participants present in the subset.
+align_labels_by_overlap <- function(reference, candidate, k) {
+  overlap <- table(
+    factor(reference, levels = seq_len(k)),
+    factor(candidate, levels = seq_len(k))
+  )
+
+  # assignment[r] gives the candidate cluster matched to reference cluster r.
+  assignment <- as.integer(clue::solve_LSAP(overlap, maximum = TRUE))
+  candidate_to_reference <- setNames(seq_len(k), assignment)
+  as.integer(candidate_to_reference[as.character(candidate)])
+}
+
+cluster_jaccard <- function(reference, candidate, cluster_id) {
+  ref_set <- reference == cluster_id
+  new_set <- candidate == cluster_id
+  union_n <- sum(ref_set | new_set)
+  if (union_n == 0) return(NA_real_)
+  sum(ref_set & new_set) / union_n
+}
+
+permanova_one_factor <- function(distance_object, variable, variable_name,
+                                 permutations = 999) {
+  keep <- !is.na(variable)
+  variable <- droplevels(factor(variable[keep]))
+
+  if (length(unique(variable)) < 2) {
+    return(tibble(
+      term = variable_name, df = NA_real_, sum_of_squares = NA_real_,
+      R2 = NA_real_, F = NA_real_, p_value = NA_real_
+    ))
+  }
+
+  distance_subset <- as.dist(as.matrix(distance_object)[keep, keep])
+  dat <- data.frame(test_variable = variable)
+  fit <- vegan::adonis2(
+    distance_subset ~ test_variable,
+    data = dat,
+    permutations = permutations
+  )
+
+  tibble(
+    term = variable_name,
+    df = fit$Df[1],
+    sum_of_squares = fit$SumOfSqs[1],
+    R2 = fit$R2[1],
+    F = fit$F[1],
+    p_value = fit$`Pr(>F)`[1]
+  )
+}
+```
+
+# Prepare the KPMP matrix
+
+```{r prepare-kpmp}
+prepare_kpmp <- function(plasma_path, clinical_path) {
+  plasma_raw <- readxl::read_excel(plasma_path) %>%
+    janitor::clean_names()
+
+  pid_col  <- find_first_col(
+    plasma_raw,
+    c("participant_id", "participant", "participantid")
+  )
+  met_col  <- find_first_col(plasma_raw, c("metabolite", "metabolite_id"))
+  ab_col   <- find_first_col(
+    plasma_raw,
+    c("abundance", "value", "intensity", "peak_area")
+  )
+  name_col <- find_first_col(
+    plasma_raw,
+    c("chemical_name", "chemical_name_", "chem_name", "biochemical")
+  )
+
+  if (any(is.na(c(pid_col, met_col, ab_col)))) {
+    stop("Could not detect the required columns in Plasma_Metabolomics.xlsx")
+  }
+
+  plasma_long <- plasma_raw %>%
+    transmute(
+      participant_id = clean_id(.data[[pid_col]]),
+      metabolite = as.character(.data[[met_col]]),
+      metabolite_label = if (!is.na(name_col)) {
+        as.character(.data[[name_col]])
+      } else {
+        as.character(.data[[met_col]])
+      },
+      abundance = suppressWarnings(as.numeric(.data[[ab_col]]))
+    ) %>%
+    filter(
+      !is.na(participant_id), !is.na(metabolite), !is.na(abundance)
+    )
+
+  labels <- plasma_long %>%
+    distinct(metabolite, metabolite_label)
+
+  wide <- plasma_long %>%
+    group_by(participant_id, metabolite) %>%
+    summarize(abundance = median(abundance, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = metabolite, values_from = abundance)
+
+  missingness <- wide %>%
+    summarize(across(-participant_id, ~ mean(is.na(.x)))) %>%
+    pivot_longer(everything(), names_to = "metabolite", values_to = "missing_rate")
+
+  retained_metabolites <- missingness %>%
+    filter(missing_rate <= 0.70) %>%
+    pull(metabolite)
+
+  wide <- wide %>%
+    select(participant_id, all_of(retained_metabolites))
+
+  clinical_raw <- readxl::read_excel(clinical_path) %>%
+    janitor::clean_names()
+
+  clinical_pid_col <- find_first_col(
+    clinical_raw,
+    c("participant_id", "participant", "participantid")
+  )
+  sample_col <- find_first_col(
+    clinical_raw,
+    c("sample_id", "sampleid", "specimen_id")
+  )
+  group_col <- find_first_col(
+    clinical_raw,
+    c("group", "enrollment_category", "disease_group")
+  )
+  egfr_col <- find_first_col(
+    clinical_raw,
+    c(
+      "baseline_e_gfr_ml_min_1_73m2", "baseline_egfr_ml_min_1_73m2",
+      "baseline_egfr_ml_min_1_73_m2", "egfrcr_cys", "egfr"
+    )
+  )
+
+  if (any(is.na(c(clinical_pid_col, group_col, egfr_col)))) {
+    stop("Could not detect participant ID, group, or eGFR in the KPMP clinical file")
+  }
+
+  clinical <- clinical_raw %>%
+    transmute(
+      participant_id = clean_id(.data[[clinical_pid_col]]),
+      sample_id = if (!is.na(sample_col)) {
+        clean_id(.data[[sample_col]])
+      } else {
+        participant_id
+      },
+      group = as.character(.data[[group_col]]),
+      egfr = suppressWarnings(as.numeric(.data[[egfr_col]]))
+    ) %>%
+    distinct(participant_id, .keep_all = TRUE)
+
+  analysis_df <- wide %>%
+    inner_join(clinical, by = "participant_id")
+
+  meta <- analysis_df %>%
+    select(participant_id, sample_id, group, egfr)
+
+  X_raw <- analysis_df %>%
+    select(all_of(retained_metabolites)) %>%
+    as.matrix()
+
+  rownames(X_raw) <- meta$participant_id
+
+  list(
+    meta = meta,
+    X_raw = X_raw,
+    labels = labels,
+    missingness = missingness
+  )
+}
+
+kpmp <- prepare_kpmp(kpmp_plasma_path, kpmp_clinical_path)
+
+cat(
+  "KPMP matrix:", nrow(kpmp$X_raw), "participants x",
+  ncol(kpmp$X_raw), "metabolites\n"
+)
+```
+
+# Prepare the combined validation matrix
+
+```{r prepare-validation}
+prepare_validation <- function(validation_path) {
+  combined_raw <- readxl::read_excel(validation_path, sheet = "Combined")
+  clean_names <- janitor::make_clean_names(names(combined_raw))
+
+  original_name <- function(clean_name) {
+    hit <- which(clean_names == clean_name)
+    if (length(hit) == 0) return(NA_character_)
+    names(combined_raw)[hit[1]]
+  }
+
+  sample_col <- original_name("sample_id")
+  cohort_col <- original_name("cohort")
+  group_col  <- original_name("group")
+
+  egfr_candidates <- c(
+    "baseline_e_gfr_ml_min_1_73m2", "baseline_egfr_ml_min_1_73m2",
+    "baseline_egfr_ml_min_1_73_m2", "egfrcr_cys", "egfr"
+  )
+  egfr_hit <- which(clean_names %in% egfr_candidates)
+  egfr_col <- if (length(egfr_hit) > 0) names(combined_raw)[egfr_hit[1]] else NA_character_
+
+  if (any(is.na(c(sample_col, cohort_col, group_col)))) {
+    stop(
+      "The Combined sheet of Validation_cleaned.xlsx must contain ",
+      "sample_id, cohort, and group columns."
+    )
+  }
+
+  meta <- combined_raw %>%
+    transmute(
+      sample_id = clean_id(.data[[sample_col]]),
+      cohort = as.character(.data[[cohort_col]]),
+      group = as.character(.data[[group_col]]),
+      egfr = if (!is.na(egfr_col)) {
+        suppressWarnings(as.numeric(.data[[egfr_col]]))
+      } else {
+        NA_real_
+      }
+    )
+
+  metadata_columns <- c(sample_col, cohort_col, group_col)
+  if (!is.na(egfr_col)) metadata_columns <- c(metadata_columns, egfr_col)
+
+  feature_df <- combined_raw %>%
+    select(-all_of(metadata_columns))
+
+  feature_names <- names(feature_df)
+  metabolite_ids <- extract_bracket_id(feature_names)
+  metabolite_names <- extract_validation_name(feature_names)
+
+  keep_feature <- !is.na(metabolite_ids)
+  feature_df <- feature_df[, keep_feature, drop = FALSE] %>%
+    mutate(across(everything(), ~ suppressWarnings(as.numeric(.))))
+  metabolite_ids <- metabolite_ids[keep_feature]
+  metabolite_names <- metabolite_names[keep_feature]
+
+  X0 <- as.matrix(feature_df)
+  unique_ids <- unique(metabolite_ids)
+
+  X_list <- lapply(unique_ids, function(id) {
+    idx <- which(metabolite_ids == id)
+    values <- X0[, idx, drop = FALSE]
+    if (ncol(values) == 1) {
+      as.numeric(values[, 1])
+    } else {
+      apply(values, 1, median, na.rm = TRUE)
+    }
+  })
+
+  X_raw <- do.call(cbind, X_list)
+  if (is.vector(X_raw)) X_raw <- matrix(X_raw, ncol = 1)
+  colnames(X_raw) <- unique_ids
+  rownames(X_raw) <- meta$sample_id
+
+  sd_value <- apply(X_raw, 2, sd, na.rm = TRUE)
+  prevalence <- 100 * colSums(!is.na(X_raw) & X_raw != 0) / nrow(X_raw)
+  retain <- is.finite(sd_value) & sd_value > 0 & prevalence >= 30
+  X_raw <- X_raw[, retain, drop = FALSE]
+
+  # Preserve the original validation preprocessing: undetected values are zero.
+  X_raw[is.na(X_raw)] <- 0
+
+  labels <- tibble(
+    metabolite = unique_ids,
+    metabolite_label = vapply(
+      unique_ids,
+      function(id) metabolite_names[match(id, metabolite_ids)][1],
+      character(1)
+    )
+  ) %>%
+    filter(metabolite %in% colnames(X_raw)) %>%
+    distinct(metabolite, .keep_all = TRUE)
+
+  list(meta = meta, X_raw = X_raw, labels = labels)
+}
+
+validation <- prepare_validation(validation_path)
+
+shared_metabolites <- intersect(
+  colnames(kpmp$X_raw),
+  colnames(validation$X_raw)
+)
+
+message("Shared KPMP-validation metabolites: ", length(shared_metabolites))
+
+if (length(shared_metabolites) != expected_shared_metabolites) {
+  count_message <- paste0(
+    "Expected ", expected_shared_metabolites, " shared metabolites but found ",
+    length(shared_metabolites), ". Check the input files and filtering."
+  )
+  if (enforce_expected_shared_count) stop(count_message) else warning(count_message)
+}
+
+validation$X_raw <- validation$X_raw[, shared_metabolites, drop = FALSE]
+
+cat(
+  "Validation matrix:", nrow(validation$X_raw), "participants x",
+  ncol(validation$X_raw), "shared metabolites\n"
+)
+```
+
+# Full-data metabotype discovery
+
+```{r discovery-functions}
+discover_metabotypes <- function(X_raw, meta, id_col, group_col, egfr_col,
+                                 cohort_name, k_grid = 2:10,
+                                 nstart = 50, seed = 123,
+                                 permutations = 999) {
+  preprocessing <- preprocess_full_matrix(X_raw)
+  X_scaled <- preprocessing$X
+  rownames(X_scaled) <- meta[[id_col]]
+  distance_object <- dist(X_scaled, method = "euclidean")
+
+  silhouette_scores <- vapply(k_grid, function(k) {
+    # The original analysis reset the same seed for every candidate k.
+    set.seed(seed)
+    fit <- tryCatch(
+      kmeans(
+        X_scaled,
+        centers = k,
+        nstart = nstart,
+        algorithm = "Hartigan-Wong"
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) return(NA_real_)
+    mean(cluster::silhouette(fit$cluster, distance_object)[, "sil_width"])
+  }, numeric(1))
+
+  valid <- which(is.finite(silhouette_scores))
+  if (length(valid) == 0) stop("No valid silhouette scores for ", cohort_name)
+
+  k_best <- k_grid[valid[which.max(silhouette_scores[valid])]]
+
+  set.seed(seed)
+  final_fit <- kmeans(
+    X_scaled,
+    centers = k_best,
+    nstart = nstart,
+    algorithm = "Hartigan-Wong"
+  )
+  original_cluster <- final_fit$cluster
+
+  egfr_values <- suppressWarnings(as.numeric(meta[[egfr_col]]))
+  if (any(is.finite(egfr_values))) {
+    cluster_summary <- tapply(
+      egfr_values,
+      original_cluster,
+      mean,
+      na.rm = TRUE
+    )
+    label_order <- order(cluster_summary, na.last = TRUE)
+    label_basis <- "ascending mean eGFR"
+  } else {
+    ckd_indicator <- grepl("CKD", meta[[group_col]], ignore.case = TRUE)
+    cluster_summary <- tapply(
+      as.numeric(ckd_indicator),
+      original_cluster,
+      mean,
+      na.rm = TRUE
+    )
+    label_order <- order(cluster_summary, decreasing = TRUE, na.last = TRUE)
+    label_basis <- "decreasing CKD prevalence (eGFR unavailable)"
+  }
+
+  label_map <- setNames(seq_along(label_order), label_order)
+  metabotype <- as.integer(label_map[as.character(original_cluster)])
+
+  assignments <- meta %>%
+    mutate(
+      cohort_analysis = cohort_name,
+      metabotype = factor(metabotype, levels = seq_len(k_best))
+    )
+
+  silhouette_table <- tibble(
+    cohort_analysis = cohort_name,
+    k = k_grid,
+    mean_silhouette_width = silhouette_scores,
+    selected = k_grid == k_best
+  )
+
+  pca <- prcomp(X_scaled, center = FALSE, scale. = FALSE)
+  variance_explained <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+  pca_scores <- assignments %>%
+    transmute(
+      participant_id = .data[[id_col]],
+      cohort_analysis,
+      group = .data[[group_col]],
+      metabotype,
+      PC1 = pca$x[, 1],
+      PC2 = pca$x[, 2],
+      PC1_variance = variance_explained[1],
+      PC2_variance = variance_explained[2]
+    )
+
+  permanova <- bind_rows(
+    permanova_one_factor(
+      distance_object, metabotype, "metabotype", permutations
+    ),
+    permanova_one_factor(
+      distance_object, meta[[group_col]], "enrollment_group", permutations
+    )
+  ) %>%
+    mutate(cohort_analysis = cohort_name, .before = 1)
+
+  list(
+    cohort = cohort_name,
+    X_raw = X_raw,
+    X_scaled = X_scaled,
+    preprocessing = preprocessing,
+    distance = distance_object,
+    k = k_best,
+    fit = final_fit,
+    assignments = assignments,
+    reference_labels = metabotype,
+    silhouette = silhouette_table,
+    pca_scores = pca_scores,
+    permanova = permanova,
+    label_basis = label_basis
+  )
+}
+```
+
+```{r run-discovery}
+kpmp_result <- discover_metabotypes(
+  X_raw = kpmp$X_raw,
+  meta = kpmp$meta,
+  id_col = "participant_id",
+  group_col = "group",
+  egfr_col = "egfr",
+  cohort_name = "KPMP",
+  k_grid = k_grid,
+  nstart = nstart_kmeans,
+  seed = random_seed,
+  permutations = n_perm
+)
+
+validation_result <- discover_metabotypes(
+  X_raw = validation$X_raw,
+  meta = validation$meta,
+  id_col = "sample_id",
+  group_col = "group",
+  egfr_col = "egfr",
+  cohort_name = "Validation",
+  k_grid = k_grid,
+  nstart = nstart_kmeans,
+  seed = random_seed,
+  permutations = n_perm
+)
+
+cat(
+  "KPMP: k =", kpmp_result$k,
+  "; labels ordered by", kpmp_result$label_basis, "\n"
+)
+cat(
+  "Validation: k =", validation_result$k,
+  "; labels ordered by", validation_result$label_basis, "\n"
+)
+```
+
+# Discovery outputs
+
+```{r discovery-outputs}
+silhouette_table <- bind_rows(
+  kpmp_result$silhouette,
+  validation_result$silhouette
+)
+
+permanova_table <- bind_rows(
+  kpmp_result$permanova,
+  validation_result$permanova
+)
+
+kpmp_assignments <- kpmp_result$assignments %>%
+  transmute(
+    participant_id,
+    sample_id,
+    source_cohort = "KPMP",
+    enrollment_group = group,
+    egfr,
+    metabotype = as.integer(as.character(metabotype))
+  )
+
+validation_assignments <- validation_result$assignments %>%
+  transmute(
+    participant_id = sample_id,
+    sample_id,
+    source_cohort = cohort,
+    enrollment_group = group,
+    egfr,
+    metabotype = as.integer(as.character(metabotype))
+  )
+
+all_assignments <- bind_rows(kpmp_assignments, validation_assignments)
+
+readr::write_csv(
+  silhouette_table,
+  file.path(output_dir, "Table_silhouette_scores.csv")
+)
+readr::write_csv(
+  permanova_table,
+  file.path(output_dir, "Table_PERMANOVA_results.csv")
+)
+readr::write_csv(
+  all_assignments,
+  file.path(output_dir, "Table_metabotype_assignments.csv")
+)
+
+p_silhouette <- ggplot(
+  silhouette_table,
+  aes(x = k, y = mean_silhouette_width, color = cohort_analysis)
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.2) +
+  geom_point(
+    data = filter(silhouette_table, selected),
+    size = 4,
+    shape = 21,
+    fill = "white",
+    stroke = 1.2
+  ) +
+  scale_color_manual(values = cohort_colors) +
+  scale_x_continuous(breaks = k_grid) +
+  labs(
+    x = "Number of clusters (k)",
+    y = "Mean silhouette width",
+    color = NULL
+  ) +
+  theme(legend.position = "top")
+
+make_pca_plot <- function(result) {
+  pca_df <- result$pca_scores
+  ggplot(
+    pca_df,
+    aes(PC1, PC2, color = metabotype, fill = metabotype)
+  ) +
+    stat_ellipse(
+      aes(group = metabotype),
+      type = "norm",
+      level = 0.95,
+      geom = "polygon",
+      alpha = 0.12,
+      linewidth = 0.6,
+      show.legend = FALSE
+    ) +
+    geom_point(aes(shape = group), size = 2.3, alpha = 0.85) +
+    scale_color_manual(values = metabotype_colors) +
+    scale_fill_manual(values = metabotype_colors) +
+    labs(
+      title = result$cohort,
+      x = paste0("PC1 (", round(pca_df$PC1_variance[1], 1), "% variance)"),
+      y = paste0("PC2 (", round(pca_df$PC2_variance[1], 1), "% variance)"),
+      color = "Metabotype",
+      fill = "Metabotype",
+      shape = "Group"
+    ) +
+    theme(legend.position = "right")
+}
+
+p_discovery <- p_silhouette / (
+  make_pca_plot(kpmp_result) | make_pca_plot(validation_result)
+) +
+  plot_annotation(tag_levels = "A")
+
+save_tiff(
+  p_discovery,
+  "Figure_metabotype_discovery.tiff",
+  width = 12,
+  height = 9
+)
+
+p_discovery
+```
+
+# Repeated-subsampling stability analysis
+
+
+```{r subsampling-function}
+run_subsampling_stability <- function(
+    X_raw,
+    participant_ids,
+    reference_labels,
+    k,
+    cohort_name,
+    use_log2,
+    n_iterations = 1000,
+    fraction = 0.80,
+    nstart = 50,
+    seed = 20261007) {
+
+  n <- nrow(X_raw)
+  sample_size <- floor(fraction * n)
+  if (sample_size <= k) stop("Subsample size must be greater than k")
+
+  times_sampled <- integer(n)
+  times_concordant <- integer(n)
+  iteration_rows <- vector("list", n_iterations)
+  jaccard_rows <- vector("list", n_iterations)
+
+  set.seed(seed)
+
+  for (iteration in seq_len(n_iterations)) {
+    sampled_index <- sort(sample.int(n, size = sample_size, replace = FALSE))
+    X_subset <- preprocess_subsample_matrix(
+      X_raw[sampled_index, , drop = FALSE],
+      use_log2 = use_log2
+    )
+
+    fit <- tryCatch(
+      kmeans(
+        X_subset,
+        centers = k,
+        nstart = nstart,
+        algorithm = "Hartigan-Wong"
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit)) {
+      iteration_rows[[iteration]] <- tibble(
+        cohort_analysis = cohort_name,
+        iteration = iteration,
+        n_sampled = sample_size,
+        ari = NA_real_,
+        successful = FALSE
+      )
+      next
+    }
+
+    reference_subset <- reference_labels[sampled_index]
+    aligned_subset <- align_labels_by_overlap(
+      reference_subset,
+      fit$cluster,
+      k
+    )
+
+    ari <- adjusted_rand_index(reference_subset, aligned_subset)
+
+    times_sampled[sampled_index] <- times_sampled[sampled_index] + 1L
+    times_concordant[sampled_index] <-
+      times_concordant[sampled_index] +
+      as.integer(aligned_subset == reference_subset)
+
+    iteration_rows[[iteration]] <- tibble(
+      cohort_analysis = cohort_name,
+      iteration = iteration,
+      n_sampled = sample_size,
+      ari = ari,
+      successful = TRUE
+    )
+
+    jaccard_rows[[iteration]] <- tibble(
+      cohort_analysis = cohort_name,
+      iteration = iteration,
+      metabotype = seq_len(k),
+      jaccard = vapply(
+        seq_len(k),
+        function(cluster_id) {
+          cluster_jaccard(reference_subset, aligned_subset, cluster_id)
+        },
+        numeric(1)
+      )
+    )
+  }
+
+  participant_stability <- tibble(
+    cohort_analysis = cohort_name,
+    participant_id = participant_ids,
+    metabotype = reference_labels,
+    iterations_sampled = times_sampled,
+    concordant_assignments = times_concordant,
+    assignment_consistency = ifelse(
+      times_sampled > 0,
+      times_concordant / times_sampled,
+      NA_real_
+    )
+  )
+
+  list(
+    iteration_metrics = bind_rows(iteration_rows),
+    cluster_jaccard = bind_rows(jaccard_rows),
+    participant_stability = participant_stability
+  )
+}
+```
+
+```{r run-subsampling}
+kpmp_stability <- run_subsampling_stability(
+  X_raw = kpmp_result$X_raw,
+  participant_ids = kpmp$meta$participant_id,
+  reference_labels = kpmp_result$reference_labels,
+  k = kpmp_result$k,
+  cohort_name = "KPMP",
+  use_log2 = kpmp_result$preprocessing$use_log2,
+  n_iterations = n_subsamples,
+  fraction = subsample_fraction,
+  nstart = nstart_kmeans,
+  seed = subsample_seed
+)
+
+validation_stability <- run_subsampling_stability(
+  X_raw = validation_result$X_raw,
+  participant_ids = validation$meta$sample_id,
+  reference_labels = validation_result$reference_labels,
+  k = validation_result$k,
+  cohort_name = "Validation",
+  use_log2 = validation_result$preprocessing$use_log2,
+  n_iterations = n_subsamples,
+  fraction = subsample_fraction,
+  nstart = nstart_kmeans,
+  seed = subsample_seed + 1
+)
+
+iteration_metrics <- bind_rows(
+  kpmp_stability$iteration_metrics,
+  validation_stability$iteration_metrics
+)
+
+jaccard_metrics <- bind_rows(
+  kpmp_stability$cluster_jaccard,
+  validation_stability$cluster_jaccard
+)
+
+participant_stability <- bind_rows(
+  kpmp_stability$participant_stability,
+  validation_stability$participant_stability
+)
+```
+
+# Stability tables and figure
+
+```{r stability-outputs, fig.width=12, fig.height=9}
+stability_summary <- iteration_metrics %>%
+  filter(successful) %>%
+  group_by(cohort_analysis) %>%
+  summarize(
+    successful_iterations = n(),
+    median_ari = median(ari, na.rm = TRUE),
+    ari_q1 = quantile(ari, 0.25, na.rm = TRUE),
+    ari_q3 = quantile(ari, 0.75, na.rm = TRUE),
+    ari_2.5_percentile = quantile(ari, 0.025, na.rm = TRUE),
+    ari_97.5_percentile = quantile(ari, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+jaccard_summary <- jaccard_metrics %>%
+  group_by(cohort_analysis, metabotype) %>%
+  summarize(
+    median_jaccard = median(jaccard, na.rm = TRUE),
+    jaccard_q1 = quantile(jaccard, 0.25, na.rm = TRUE),
+    jaccard_q3 = quantile(jaccard, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+participant_summary <- participant_stability %>%
+  group_by(cohort_analysis, metabotype) %>%
+  summarize(
+    n_participants = n(),
+    median_assignment_consistency = median(
+      assignment_consistency,
+      na.rm = TRUE
+    ),
+    assignment_consistency_q1 = quantile(
+      assignment_consistency,
+      0.25,
+      na.rm = TRUE
+    ),
+    assignment_consistency_q3 = quantile(
+      assignment_consistency,
+      0.75,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  iteration_metrics,
+  file.path(output_dir, "Table_subsampling_iteration_metrics.csv")
+)
+readr::write_csv(
+  jaccard_metrics,
+  file.path(output_dir, "Table_subsampling_cluster_Jaccard.csv")
+)
+readr::write_csv(
+  participant_stability,
+  file.path(output_dir, "Table_participant_assignment_stability.csv")
+)
+readr::write_csv(
+  stability_summary,
+  file.path(output_dir, "Table_subsampling_stability_summary.csv")
+)
+readr::write_csv(
+  jaccard_summary,
+  file.path(output_dir, "Table_cluster_Jaccard_summary.csv")
+)
+readr::write_csv(
+  participant_summary,
+  file.path(output_dir, "Table_participant_stability_summary.csv")
+)
+
+p_ari <- iteration_metrics %>%
+  filter(successful) %>%
+  ggplot(aes(x = cohort_analysis, y = ari, fill = cohort_analysis)) +
+  geom_violin(width = 0.8, alpha = 0.45, trim = FALSE) +
+  geom_boxplot(width = 0.22, outlier.shape = NA, alpha = 0.9) +
+  scale_fill_manual(values = cohort_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = NULL,
+    y = "Adjusted Rand index",
+    title = "Overall assignment stability"
+  ) +
+  theme(legend.position = "none")
+
+p_jaccard <- jaccard_metrics %>%
+  mutate(metabotype = factor(metabotype)) %>%
+  ggplot(aes(x = metabotype, y = jaccard, fill = metabotype)) +
+  geom_violin(width = 0.8, alpha = 0.40, trim = FALSE) +
+  geom_boxplot(width = 0.22, outlier.shape = NA, alpha = 0.9) +
+  facet_wrap(~ cohort_analysis) +
+  scale_fill_manual(values = metabotype_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Full-data metabotype",
+    y = "Jaccard similarity",
+    title = "Cluster-specific stability"
+  ) +
+  theme(legend.position = "none")
+
+participant_plot_df <- participant_stability %>%
+  group_by(cohort_analysis) %>%
+  arrange(metabotype, assignment_consistency, .by_group = TRUE) %>%
+  mutate(participant_rank = row_number()) %>%
+  ungroup() %>%
+  mutate(metabotype = factor(metabotype))
+
+p_participant <- ggplot(
+  participant_plot_df,
+  aes(
+    x = participant_rank,
+    y = assignment_consistency,
+    color = metabotype
+  )
+) +
+  geom_point(size = 1.8, alpha = 0.85) +
+  facet_wrap(~ cohort_analysis, scales = "free_x") +
+  scale_color_manual(values = metabotype_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Participants ordered by reference metabotype and stability",
+    y = "Assignment consistency",
+    color = "Metabotype",
+    title = "Participant-level stability"
+  ) +
+  theme(legend.position = "top")
+
+p_stability <- (p_ari | p_jaccard) / p_participant +
+  plot_annotation(
+    title = paste0(
+      "Metabotype stability across ", n_subsamples,
+      " repeated ", round(100 * subsample_fraction), "% subsamples"
+    ),
+    tag_levels = "A"
+  )
+
+save_tiff(
+  p_stability,
+  "Figure_metabotype_subsampling_stability.tiff",
+  width = 12,
+  height = 9
+)
+
+ggsave(
+  filename = file.path(
+    figure_dir,
+    "Figure_metabotype_subsampling_stability.pdf"
+  ),
+  plot = p_stability,
+  width = 12,
+  height = 9,
+  units = "in"
+)
+
+p_stability
+```
+
+
+# Numerical stability summary
+
+```{r display-summary}
+stability_summary
+jaccard_summary
+participant_summary
+```
+
+#################################
+# Validation analysis with k fixed at 2
+
+The KPMP discovery analysis selected two metabotypes. The analyses below treat
+this value of *k* as prespecified for the validation cohort. The validation
+cohort is therefore refit with exactly two clusters, and all validation
+subsampling metrics are recalculated against that full-data two-cluster
+reference solution. Output filenames include `validation_k2`, so these results
+do not overwrite the preceding analysis in which *k* was selected independently
+within each cohort.
+
+```{r validation-k2-reference}
+# Passing only k = 2 forces a two-cluster validation solution while preserving
+# the original preprocessing, k-means settings, label ordering, PCA, and
+# PERMANOVA calculations used above.
+validation_result_k2 <- discover_metabotypes(
+  X_raw = validation$X_raw,
+  meta = validation$meta,
+  id_col = "sample_id",
+  group_col = "group",
+  egfr_col = "egfr",
+  cohort_name = "Validation",
+  k_grid = 2L,
+  nstart = nstart_kmeans,
+  seed = random_seed,
+  permutations = n_perm
+)
+
+stopifnot(validation_result_k2$k == 2L)
+
+cat(
+  "Validation analysis: k =", validation_result_k2$k,
+  "; labels ordered by", validation_result_k2$label_basis, "\n"
+)
+
+# Retain the complete validation silhouette curve, but mark k = 2 as the
+# prespecified validation value rather than the independently maximizing value.
+validation_k2_silhouette_table <- validation_result$silhouette %>%
+  mutate(
+    selected = k == 2L,
+    selection_basis = if_else(
+      selected,
+      "Prespecified from KPMP discovery cohort",
+      "Not selected"
+    )
+  )
+
+validation_k2_assignments <- validation_result_k2$assignments %>%
+  transmute(
+    participant_id = sample_id,
+    sample_id,
+    source_cohort = cohort,
+    enrollment_group = group,
+    egfr,
+    metabotype = as.integer(as.character(metabotype))
+  )
+
+readr::write_csv(
+  validation_k2_silhouette_table,
+  file.path(output_dir, "Table_validation_k2_silhouette_scores.csv")
+)
+readr::write_csv(
+  validation_result_k2$permanova,
+  file.path(output_dir, "Table_validation_k2_PERMANOVA_results.csv")
+)
+readr::write_csv(
+  validation_k2_assignments,
+  file.path(output_dir, "Table_validation_k2_metabotype_assignments.csv")
+)
+```
+
+## Validation k = 2 discovery figure
+
+```{r validation-k2-discovery-figure, fig.width=12, fig.height=5.5}
+p_validation_k2_silhouette <- ggplot(
+  validation_k2_silhouette_table,
+  aes(x = k, y = mean_silhouette_width)
+) +
+  geom_line(color = cohort_colors[["Validation"]], linewidth = 0.9) +
+  geom_point(color = cohort_colors[["Validation"]], size = 2.2) +
+  geom_point(
+    data = filter(validation_k2_silhouette_table, selected),
+    size = 4,
+    shape = 21,
+    color = cohort_colors[["Validation"]],
+    fill = "white",
+    stroke = 1.2
+  ) +
+  scale_x_continuous(breaks = k_grid) +
+  labs(
+    title = "Validation cluster-number assessment",
+    subtitle = "k = 2 prespecified from the KPMP discovery cohort",
+    x = "Number of clusters (k)",
+    y = "Mean silhouette width"
+  )
+
+p_validation_k2_discovery <-
+  (p_validation_k2_silhouette | make_pca_plot(validation_result_k2)) +
+  plot_annotation(tag_levels = "A")
+
+save_tiff(
+  p_validation_k2_discovery,
+  "Figure_validation_k2_metabotype_discovery.tiff",
+  width = 12,
+  height = 5.5
+)
+
+ggsave(
+  filename = file.path(
+    figure_dir,
+    "Figure_validation_k2_metabotype_discovery.pdf"
+  ),
+  plot = p_validation_k2_discovery,
+  width = 12,
+  height = 5.5,
+  units = "in"
+)
+
+p_validation_k2_discovery
+```
+
+## Repeated subsampling with validation k = 2
+
+```{r run-validation-k2-subsampling}
+validation_stability_k2 <- run_subsampling_stability(
+  X_raw = validation_result_k2$X_raw,
+  participant_ids = validation$meta$sample_id,
+  reference_labels = validation_result_k2$reference_labels,
+  k = 2L,
+  cohort_name = "Validation",
+  use_log2 = validation_result_k2$preprocessing$use_log2,
+  n_iterations = n_subsamples,
+  fraction = subsample_fraction,
+  nstart = nstart_kmeans,
+  seed = subsample_seed + 1
+)
+
+# Reuse the previously calculated KPMP results and replace only the validation
+# results with those obtained using the prespecified two-cluster solution.
+iteration_metrics_k2 <- bind_rows(
+  kpmp_stability$iteration_metrics,
+  validation_stability_k2$iteration_metrics
+)
+
+jaccard_metrics_k2 <- bind_rows(
+  kpmp_stability$cluster_jaccard,
+  validation_stability_k2$cluster_jaccard
+)
+
+participant_stability_k2 <- bind_rows(
+  kpmp_stability$participant_stability,
+  validation_stability_k2$participant_stability
+)
+```
+
+## Validation k = 2 stability tables
+
+```{r validation-k2-stability-tables}
+stability_summary_k2 <- iteration_metrics_k2 %>%
+  group_by(cohort_analysis) %>%
+  summarize(
+    requested_iterations = n(),
+    successful_iterations = sum(successful),
+    failed_iterations = sum(!successful),
+    median_ari = median(ari[successful], na.rm = TRUE),
+    ari_q1 = quantile(ari[successful], 0.25, na.rm = TRUE),
+    ari_q3 = quantile(ari[successful], 0.75, na.rm = TRUE),
+    ari_2.5_percentile = quantile(ari[successful], 0.025, na.rm = TRUE),
+    ari_97.5_percentile = quantile(ari[successful], 0.975, na.rm = TRUE),
+    proportion_ari_below_0.80 = mean(ari[successful] < 0.80, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+jaccard_summary_k2 <- jaccard_metrics_k2 %>%
+  group_by(cohort_analysis, metabotype) %>%
+  summarize(
+    successful_iterations = sum(is.finite(jaccard)),
+    median_jaccard = median(jaccard, na.rm = TRUE),
+    jaccard_q1 = quantile(jaccard, 0.25, na.rm = TRUE),
+    jaccard_q3 = quantile(jaccard, 0.75, na.rm = TRUE),
+    jaccard_2.5_percentile = quantile(jaccard, 0.025, na.rm = TRUE),
+    jaccard_97.5_percentile = quantile(jaccard, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+participant_summary_k2 <- participant_stability_k2 %>%
+  group_by(cohort_analysis, metabotype) %>%
+  summarize(
+    n_participants = n(),
+    median_assignment_consistency = median(
+      assignment_consistency,
+      na.rm = TRUE
+    ),
+    assignment_consistency_q1 = quantile(
+      assignment_consistency,
+      0.25,
+      na.rm = TRUE
+    ),
+    assignment_consistency_q3 = quantile(
+      assignment_consistency,
+      0.75,
+      na.rm = TRUE
+    ),
+    assignment_consistency_2.5_percentile = quantile(
+      assignment_consistency,
+      0.025,
+      na.rm = TRUE
+    ),
+    assignment_consistency_97.5_percentile = quantile(
+      assignment_consistency,
+      0.975,
+      na.rm = TRUE
+    ),
+    proportion_below_0.80 = mean(
+      assignment_consistency < 0.80,
+      na.rm = TRUE
+    ),
+    proportion_below_0.90 = mean(
+      assignment_consistency < 0.90,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+readr::write_csv(
+  iteration_metrics_k2,
+  file.path(
+    output_dir,
+    "Table_subsampling_iteration_metrics_validation_k2.csv"
+  )
+)
+readr::write_csv(
+  jaccard_metrics_k2,
+  file.path(
+    output_dir,
+    "Table_subsampling_cluster_Jaccard_validation_k2.csv"
+  )
+)
+readr::write_csv(
+  participant_stability_k2,
+  file.path(
+    output_dir,
+    "Table_participant_assignment_stability_validation_k2.csv"
+  )
+)
+readr::write_csv(
+  stability_summary_k2,
+  file.path(
+    output_dir,
+    "Table_subsampling_stability_summary_validation_k2.csv"
+  )
+)
+readr::write_csv(
+  jaccard_summary_k2,
+  file.path(
+    output_dir,
+    "Table_cluster_Jaccard_summary_validation_k2.csv"
+  )
+)
+readr::write_csv(
+  participant_summary_k2,
+  file.path(
+    output_dir,
+    "Table_participant_stability_summary_validation_k2.csv"
+  )
+)
+```
+
+## Validation k = 2 stability figure
+
+```{r validation-k2-stability-figure, fig.width=12, fig.height=9}
+p_ari_k2 <- iteration_metrics_k2 %>%
+  filter(successful) %>%
+  ggplot(aes(x = cohort_analysis, y = ari, fill = cohort_analysis)) +
+  geom_violin(width = 0.8, alpha = 0.45, trim = FALSE) +
+  geom_boxplot(width = 0.22, outlier.shape = NA, alpha = 0.9) +
+  scale_fill_manual(values = cohort_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = NULL,
+    y = "Adjusted Rand index",
+    title = "Overall assignment stability"
+  ) +  theme_cowplot() + panel_border(color="black") +
+  theme(legend.position = "none")
+
+p_jaccard_k2 <- jaccard_metrics_k2 %>%
+  mutate(metabotype = factor(metabotype)) %>%
+  ggplot(aes(x = metabotype, y = jaccard, fill = metabotype)) +
+  geom_violin(width = 0.8, alpha = 0.40, trim = FALSE) +
+  geom_boxplot(width = 0.22, outlier.shape = NA, alpha = 0.9) +
+  facet_wrap(~ cohort_analysis) +
+  scale_fill_manual(values = metabotype_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Full-data metabotype",
+    y = "Jaccard similarity",
+    title = "Cluster-specific stability"
+  ) + theme_cowplot() + panel_border(color="black") +
+  theme(legend.position = "none")
+
+#p_jaccard_k2 <- p_jaccard_k2 + theme_cowplot() + panel_border(color="black")
+participant_plot_df_k2 <- participant_stability_k2 %>%
+  group_by(cohort_analysis) %>%
+  arrange(metabotype, assignment_consistency, .by_group = TRUE) %>%
+  mutate(participant_rank = row_number()) %>%
+  ungroup() %>%
+  mutate(metabotype = factor(metabotype))
+
+p_participant_k2 <- ggplot(
+  participant_plot_df_k2,
+  aes(
+    x = participant_rank,
+    y = assignment_consistency,
+    color = metabotype
+  )
+) +
+  geom_point(size = 1.8, alpha = 0.85) +
+  facet_wrap(~ cohort_analysis, scales = "free_x") +
+  scale_color_manual(values = metabotype_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Participants ordered by reference metabotype and stability",
+    y = "Assignment consistency",
+    color = "Metabotype",
+    title = "Participant-level stability"
+  ) + theme_cowplot() + panel_border(color="black") +
+  theme(legend.position = "top")
+
+p_stability_k2 <- (p_ari_k2 | p_jaccard_k2) / p_participant_k2 +
+  plot_annotation(
+    title = paste0(
+      "Metabotype stability with validation k = 2 across ",
+      n_subsamples, " repeated ",
+      round(100 * subsample_fraction), "% subsamples"
+    ),
+    tag_levels = "A"
+  )
+
+save_tiff(
+  p_stability_k2,
+  "Figure_metabotype_subsampling_stability_validation_k2.tiff",
+  width = 12,
+  height = 9
+)
+
+ggsave(
+  filename = file.path(
+    figure_dir,
+    "Figure_metabotype_subsampling_stability_validation_k2.pdf"
+  ),
+  plot = p_stability_k2,
+  width = 12,
+  height = 9,
+  units = "in"
+)
+
+p_stability_k2
+```
+
+## Save and reload the validation k = 2 results
+
+```{r save-validation-k2-results}
+validation_k2_outputs <- list(
+  settings = list(
+    validation_k = 2L,
+    n_subsamples = n_subsamples,
+    subsample_fraction = subsample_fraction,
+    nstart_kmeans = nstart_kmeans,
+    discovery_seed = random_seed,
+    subsampling_seed = subsample_seed + 1L
+  ),
+  validation_result = validation_result_k2,
+  silhouette = validation_k2_silhouette_table,
+  assignments = validation_k2_assignments,
+  permanova = validation_result_k2$permanova,
+  iteration_metrics = iteration_metrics_k2,
+  cluster_jaccard = jaccard_metrics_k2,
+  participant_stability = participant_stability_k2,
+  stability_summary = stability_summary_k2,
+  jaccard_summary = jaccard_summary_k2,
+  participant_summary = participant_summary_k2,
+  discovery_figure = p_validation_k2_discovery,
+  stability_figure = p_stability_k2
+)
+
+saveRDS(
+  validation_k2_outputs,
+  file.path(output_dir, "Metabotype_validation_k2_outputs.rds")
+)
+```
+
+The saved RDS file can be loaded in a later R session without rerunning the
+subsampling analysis.
+
+```{r load-validation-k2-results, eval=FALSE}
+validation_k2_outputs <- readRDS(
+  file.path(output_dir, "Metabotype_validation_k2_outputs.rds")
+)
+
+# Examples:
+validation_k2_outputs$stability_summary
+validation_k2_outputs$jaccard_summary
+validation_k2_outputs$participant_summary
+validation_k2_outputs$discovery_figure
+validation_k2_outputs$stability_figure
+```
+
+## Numerical summary for validation k = 2
+
+```{r display-validation-k2-summary}
+stability_summary_k2
+jaccard_summary_k2
+participant_summary_k2
+```
+
+# Combined discovery and validation stability figure: k = 2 versus k = 3
+
+The composite figure below retains the discovery results and directly compares
+the two- and three-cluster validation solutions. Because
+`validation_k2_outputs$stability_figure` also contains the KPMP results, its
+underlying validation rows are used here to avoid displaying the KPMP stability
+results twice.
+
+```{r prepare-validation-k3-comparison}
+# The independently selected validation solution is currently k = 3. Reuse its
+# full-data fit and subsampling results when available. The fallback explicitly
+# fits and resamples k = 3 if a future dataset selects a different value of k.
+if (validation_result$k == 3L) {
+  validation_result_k3 <- validation_result
+  validation_stability_k3 <- validation_stability
+} else {
+  validation_result_k3 <- discover_metabotypes(
+    X_raw = validation$X_raw,
+    meta = validation$meta,
+    id_col = "sample_id",
+    group_col = "group",
+    egfr_col = "egfr",
+    cohort_name = "Validation",
+    k_grid = 3L,
+    nstart = nstart_kmeans,
+    seed = random_seed,
+    permutations = n_perm
+  )
+
+  validation_stability_k3 <- run_subsampling_stability(
+    X_raw = validation_result_k3$X_raw,
+    participant_ids = validation$meta$sample_id,
+    reference_labels = validation_result_k3$reference_labels,
+    k = 3L,
+    cohort_name = "Validation",
+    use_log2 = validation_result_k3$preprocessing$use_log2,
+    n_iterations = n_subsamples,
+    fraction = subsample_fraction,
+    nstart = nstart_kmeans,
+    seed = subsample_seed + 1
+  )
+}
+
+validation_iteration_comparison <- bind_rows(
+  validation_k2_outputs$iteration_metrics %>%
+    filter(cohort_analysis == "Validation") %>%
+    mutate(validation_k = "k = 2"),
+  validation_stability_k3$iteration_metrics %>%
+    mutate(validation_k = "k = 3")
+) %>%
+  mutate(validation_k = factor(validation_k, levels = c("k = 2", "k = 3")))
+
+validation_jaccard_comparison <- bind_rows(
+  validation_k2_outputs$cluster_jaccard %>%
+    filter(cohort_analysis == "Validation") %>%
+    mutate(validation_k = "k = 2"),
+  validation_stability_k3$cluster_jaccard %>%
+    mutate(validation_k = "k = 3")
+) %>%
+  mutate(
+    validation_k = factor(validation_k, levels = c("k = 2", "k = 3")),
+    metabotype = factor(metabotype)
+  )
+
+validation_participant_comparison <- bind_rows(
+  validation_k2_outputs$participant_stability %>%
+    filter(cohort_analysis == "Validation") %>%
+    mutate(validation_k = "k = 2"),
+  validation_stability_k3$participant_stability %>%
+    mutate(validation_k = "k = 3")
+) %>%
+  mutate(validation_k = factor(validation_k, levels = c("k = 2", "k = 3"))) %>%
+  group_by(validation_k) %>%
+  arrange(metabotype, assignment_consistency, .by_group = TRUE) %>%
+  mutate(participant_rank = row_number()) %>%
+  ungroup() %>%
+  mutate(metabotype = factor(metabotype))
+```
+
+
+
+
+
+
+```{r combined-discovery-validation-stability-figure, fig.width=14, fig.height=16}
+# Discovery panels: show the KPMP solution and both validation solutions.
+p_silhouette_k2_k3 <- p_silhouette +
+  labs(
+    title = "Silhouette analysis",
+    subtitle = paste0(
+      "Validation silhouette maximum: k = ", validation_result$k,
+      "; prespecified validation solution: k = 2"
+    )
+  )
+
+p_kpmp_pca <- make_pca_plot(kpmp_result) +
+  labs(title = paste0("KPMP (k = ", kpmp_result$k, ")"))
+
+p_validation_pca_k2 <- make_pca_plot(validation_result_k2) +
+  labs(title = "Validation (k = 2)")
+
+p_validation_pca_k3 <- make_pca_plot(validation_result_k3) +
+  labs(title = "Validation (k = 3)")
+
+p_pca_row_k2_k3 <- wrap_plots(
+  p_kpmp_pca,
+  p_validation_pca_k2,
+  p_validation_pca_k3,
+  nrow = 1,
+  ncol = 3
+)
+
+# Wrap the three-panel PCA row so it is treated as one element in the
+# two-row discovery layout.
+p_discovery_k2_k3 <- wrap_plots(
+  p_silhouette_k2_k3,
+  wrap_elements(full = p_pca_row_k2_k3),
+  nrow = 2,
+  ncol = 1,
+  heights = c(0.80, 1.20)
+)
+
+# Validation-only stability panels for direct comparison of k = 2 and k = 3.
+validation_solution_colors <- c("k = 2" = "#1b9e77", "k = 3" = "#d95f02")
+
+p_validation_ari_k2_k3 <- validation_iteration_comparison %>%
+  filter(successful) %>%
+  ggplot(aes(x = validation_k, y = ari, fill = validation_k)) +
+  geom_violin(width = 0.8, alpha = 0.45, trim = FALSE) +
+  geom_boxplot(width = 0.22, outlier.shape = NA, alpha = 0.9) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "grey45") +
+  scale_fill_manual(values = validation_solution_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = NULL,
+    y = "Adjusted Rand index",
+    title = "Validation overall stability"
+  ) +
+  theme(legend.position = "none")
+
+p_validation_jaccard_k2_k3 <- validation_jaccard_comparison %>%
+  ggplot(aes(x = metabotype, y = jaccard, fill = metabotype)) +
+  geom_violin(width = 0.8, alpha = 0.40, trim = FALSE) +
+  geom_boxplot(width = 0.22, outlier.shape = NA, alpha = 0.9) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "grey45") +
+  facet_wrap(~ validation_k) +
+  scale_fill_manual(values = metabotype_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Full-data metabotype",
+    y = "Jaccard similarity",
+    title = "Validation cluster-specific stability"
+  ) +
+  theme(legend.position = "none")
+
+p_validation_participant_k2_k3 <- ggplot(
+  validation_participant_comparison,
+  aes(
+    x = participant_rank,
+    y = assignment_consistency,
+    color = metabotype
+  )
+) +
+  geom_point(size = 1.5, alpha = 0.80) +
+  geom_hline(yintercept = 0.80, linetype = "dashed", color = "grey45") +
+  facet_wrap(~ validation_k, scales = "free_x") +
+  scale_color_manual(values = metabotype_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    x = "Validation participants ordered by metabotype and stability",
+    y = "Assignment consistency",
+    color = "Metabotype",
+    title = "Validation participant-level stability"
+  ) +
+  theme(legend.position = "top")
+
+p_validation_stability_top <- wrap_plots(
+  p_validation_ari_k2_k3,
+  p_validation_jaccard_k2_k3,
+  nrow = 1,
+  ncol = 2,
+  widths = c(0.85, 1.15)
+)
+
+p_validation_stability_k2_k3 <- wrap_plots(
+  wrap_elements(full = p_validation_stability_top),
+  p_validation_participant_k2_k3,
+  nrow = 2,
+  ncol = 1,
+  heights = c(1, 1)
+)
+
+# Wrap both multi-panel sections before stacking them. This prevents patchwork
+# from flattening their children into an incompatible two-cell layout.
+p_discovery_and_validation_stability <- wrap_plots(
+  wrap_elements(full = p_discovery_k2_k3),
+  wrap_elements(full = p_validation_stability_k2_k3),
+  nrow = 2,
+  ncol = 1,
+  heights = c(1.05, 1)
+) +
+  plot_annotation(
+    title = "Metabotype discovery and validation stability",
+    subtitle = "Comparison of two- and three-cluster validation solutions",
+    tag_levels = "A"
+  )
+
+save_tiff(
+  p_discovery_and_validation_stability,
+  "Figure_metabotype_discovery_and_validation_stability_k2_vs_k3.tiff",
+  width = 14,
+  height = 16
+)
+
+ggsave(
+  filename = file.path(
+    figure_dir,
+    "Figure_metabotype_discovery_and_validation_stability_k2_vs_k3.pdf"
+  ),
+  plot = p_discovery_and_validation_stability,
+  width = 14,
+  height = 16,
+  units = "in"
+)
+
+# Add the comparison plots to the reloadable output bundle.
+validation_k2_outputs$validation_stability_k2_vs_k3_figure <-
+  p_validation_stability_k2_k3
+validation_k2_outputs$combined_discovery_stability_figure <-
+  p_discovery_and_validation_stability
+
+saveRDS(
+  validation_k2_outputs,
+  file.path(output_dir, "Metabotype_validation_k2_outputs.rds")
+)
+
+p_discovery_and_validation_stability
+```
+
+
+```{r}
+
+```
+
+
+
+
+
